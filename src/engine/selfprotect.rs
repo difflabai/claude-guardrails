@@ -22,38 +22,48 @@ use regex::Regex;
 use crate::output::Decision;
 
 /// The guardrail's own install locations — mutation is denied unconditionally.
-const INSTALL_PATHS: &[&str] = &[r"\.claude/guardrails/", r"/etc/claude-guardrails/"];
+/// Word-bounded (not slash-terminated) so `rm ~/.claude/guardrails` — no trailing
+/// slash — is caught, and the `.claude` parent is covered as a terminal target.
+const INSTALL_PATHS: &[&str] = &[
+    r"\.claude/guardrails\b",
+    r"/etc/claude-guardrails\b",
+    r#"\.claude/?(?:["'\s;|&]|$)"#,
+];
 
 /// Marker that a settings edit touches the guardrail's hook. The hook command is
 /// `~/.claude/guardrails/claude-guardrails`, so any line registering, altering, or
-/// removing it contains this substring.
+/// removing it contains this substring. Compared case-insensitively.
 const HOOK_MARKER: &str = "guardrails";
 
 /// Matches a Claude Code settings file path.
 static SETTINGS_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\.claude/settings[^/]*\.json$").unwrap());
 
+/// A path under the guardrail's own control (binary/config, settings file, or the
+/// `.claude` dir itself). Trailing slash optional; word-bounded on the dir name.
+const SELF_PATH_ALT: &str = r#"(\.claude/guardrails\b|\.claude/settings[^/]*\.json|\.claude/?(?:["'\s;|&]|$)|/etc/claude-guardrails\b)"#;
+
 /// Mutating shell verbs that, applied to a self path, tamper with the guardrail.
+/// Note: `find` is intentionally excluded — `find ~/.claude …` is overwhelmingly a
+/// read-only search, and blocking it is a large false-positive class. The rare
+/// `find … -delete` vector is an accepted residual.
 static BASH_TAMPER: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(
+    Regex::new(&format!(
         r"(?x)
-        \b(rm|unlink|shred|mv|cp|install|truncate|chmod|chown|dd|tee|sed\s+-i|ln)\b
+        \b(rm|unlink|shred|mv|cp|install|truncate|chmod|chown|dd|tee|sed\s+-i|ln|rsync)\b
         [^|;&]*
-        (\.claude/(settings[^/]*\.json|guardrails/)|/etc/claude-guardrails/)
-        ",
-    )
+        {SELF_PATH_ALT}"
+    ))
     .unwrap()
 });
 
 /// Redirection (`>`, `>>`) onto a self path — overwrites settings or the binary.
-static BASH_REDIRECT: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r">>?\s*\S*(\.claude/(settings[^/]*\.json|guardrails/)|/etc/claude-guardrails/)")
-        .unwrap()
-});
+static BASH_REDIRECT: Lazy<Regex> =
+    Lazy::new(|| Regex::new(&format!(r">>?\s*\S*{SELF_PATH_ALT}")).unwrap());
 
-/// Attempt to set the disable/bypass env var — a tampering signal.
+/// Attempt to set the disable/bypass env var — a tampering signal (any case).
 static DISABLE_ENV: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\bGUARDRAILS_(DISABLED|WARN_ONLY)\s*=").unwrap());
+    Lazy::new(|| Regex::new(r"(?i)\bGUARDRAILS_(DISABLED|WARN_ONLY)\s*=").unwrap());
 
 /// Guardrail install paths, precompiled.
 static INSTALL_RES: Lazy<Vec<Regex>> = Lazy::new(|| {
@@ -113,14 +123,35 @@ pub fn check_settings(
         return None;
     }
 
+    // Text being introduced by this write/edit, lower-cased for case-insensitive
+    // matching (the disable vars are upper-case; the hook path is lower-case).
+    let new_text = match (edit, content) {
+        (Some((_, new)), _) => new.to_ascii_lowercase(),
+        (None, Some(c)) => c.to_ascii_lowercase(),
+        (None, None) => return None,
+    };
+
+    // Injecting a disable/warn env var into settings would neutralize the guard
+    // if Claude Code propagates settings env into the hook subprocess.
+    if new_text.contains("guardrails_disabled") || new_text.contains("guardrails_warn_only") {
+        return Some(Decision::deny(
+            "self-protect-disable",
+            "This settings edit introduces a GUARDRAILS_DISABLED/WARN_ONLY override",
+        ));
+    }
+
     let touches_hook = match (edit, content) {
         // Edit: block if either side of the change mentions the hook.
-        (Some((old, new)), _) => old.contains(HOOK_MARKER) || new.contains(HOOK_MARKER),
+        (Some((old, _)), _) => {
+            old.to_ascii_lowercase().contains(HOOK_MARKER) || new_text.contains(HOOK_MARKER)
+        }
         // Write: block only if the current file registers the hook and the new
         // content drops it (i.e. this write removes the guardrail).
-        (None, Some(new_content)) => {
-            let current = std::fs::read_to_string(&normalized).unwrap_or_default();
-            current.contains(HOOK_MARKER) && !new_content.contains(HOOK_MARKER)
+        (None, Some(_)) => {
+            let current = std::fs::read_to_string(&normalized)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            current.contains(HOOK_MARKER) && !new_text.contains(HOOK_MARKER)
         }
         (None, None) => false,
     };
@@ -250,5 +281,53 @@ mod tests {
     #[test]
     fn test_non_settings_file_ignored() {
         assert!(check_settings("~/project/config.json", Some(("guardrails", "")), None).is_none());
+    }
+
+    #[test]
+    fn test_c2_no_trailing_slash_and_parent_dir_blocked() {
+        // C2: these all bypassed the old trailing-slash-required regex.
+        for cmd in [
+            "rm -rf ~/.claude/guardrails",          // no trailing slash
+            "rm -rf ~/.claude",                     // whole parent dir
+            "rm -rf /Users/lee/.claude/guardrails", // absolute, no slash
+            "chmod -x ~/.claude/guardrails/claude-guardrails",
+            "mv ~/.claude/guardrails /tmp/x",
+        ] {
+            assert!(check_bash(cmd).is_some(), "should block: {cmd}");
+        }
+    }
+
+    #[test]
+    fn test_c2_does_not_overblock_reads_and_searches() {
+        // A specific non-guard file under .claude, reads, and searches are fine.
+        assert!(check_bash("rm ~/.claude/projects/foo/session.jsonl").is_none());
+        assert!(check_bash("cat ~/.claude/settings.json").is_none());
+        // find over .claude is a read-only search, not tampering (large FP class).
+        assert!(check_bash("find ~/.claude -type f -name '*.md'").is_none());
+        assert!(check_bash("find ~/.claude -name settings.json 2>/dev/null").is_none());
+    }
+
+    #[test]
+    fn test_h1_settings_disable_var_injection_blocked() {
+        // Case-insensitive; env-var injection tripping neither the lowercase hook
+        // marker nor a bash verb.
+        let d = check_settings(
+            "~/.claude/settings.json",
+            Some(("{}", "{\"env\": {\"GUARDRAILS_WARN_ONLY\": \"1\"}}")),
+            None,
+        );
+        assert!(d.is_some());
+        assert_eq!(d.unwrap().rule_id(), Some("self-protect-disable"));
+    }
+
+    #[test]
+    fn test_h1_hook_marker_case_insensitive() {
+        // Editing out an upper-cased hook reference still trips the marker.
+        assert!(check_settings(
+            "~/.claude/settings.json",
+            Some(("~/.claude/GUARDRAILS/claude-guardrails", "")),
+            None,
+        )
+        .is_some());
     }
 }

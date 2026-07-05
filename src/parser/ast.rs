@@ -47,9 +47,16 @@ static PIPELINE_WRAPPERS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
 /// When the source is a local command, piping to an interpreter is ordinary data
 /// processing (`fleetops state show | python3 -c '…'`) and must not be blocked.
 static REMOTE_FETCHERS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
+    // Unambiguous remote-content fetchers only. Dual-use cloud CLIs (aws, gh,
+    // gcloud, az, rclone, s3cmd) are deliberately NOT here: they're overwhelmingly
+    // used for `… | python3 -c` data pipelines (the exact pattern P1 exists to
+    // allow), so treating them as fetchers would re-introduce the false positives.
+    // Residual: remote code fetched via a dual-use CLI and piped to an interpreter
+    // is not caught here — a documented tradeoff, revisitable at higher safety levels.
     [
-        "curl", "wget", "nc", "ncat", "netcat", "fetch", "ssh", "scp", "sftp", "ftp", "http",
-        "https", "httpie", "aria2c", "socat",
+        "curl", "wget", "wget2", "curlie", "xh", "nc", "ncat", "netcat", "fetch", "ssh", "scp",
+        "sftp", "ftp", "tftp", "http", "https", "httpie", "aria2c", "axel", "socat", "openssl",
+        "lynx", "w3m", "links",
     ]
     .into_iter()
     .collect()
@@ -86,9 +93,14 @@ pub struct CommandAnalysis {
     pub has_pipe_to_shell: bool,
     /// Whether there's a pipeline to a script interpreter
     pub has_pipe_to_interpreter: bool,
-    /// Whether a pipeline feeding an interpreter is sourced from remote content
-    /// (`curl … | python3`). Distinguishes RCE from local data processing.
+    /// Whether ANY pipeline is sourced from remote content (informational).
     pub pipe_source_is_remote: bool,
+    /// Whether a SINGLE pipeline both is sourced from remote content AND feeds an
+    /// interpreter (`curl … | python3`) — i.e. remote code execution. Computed
+    /// per-pipeline (with wrapper unwrapping on the source) so a benign remote pipe
+    /// in one compound segment and a local data→interpreter pipe in another don't
+    /// combine into a false deny. This is the flag the RCE rule keys on.
+    pub has_remote_source_to_interpreter: bool,
     /// Raw AST parse succeeded
     pub parsed: bool,
     /// Error message if parsing failed
@@ -123,6 +135,7 @@ pub fn analyze_command(source: &str) -> CommandAnalysis {
             has_pipe_to_shell: false,
             has_pipe_to_interpreter: false,
             pipe_source_is_remote: false,
+            has_remote_source_to_interpreter: false,
             parsed: false,
             error: Some("Failed to load tree-sitter-bash language".to_string()),
         };
@@ -137,6 +150,7 @@ pub fn analyze_command(source: &str) -> CommandAnalysis {
                 has_pipe_to_shell: false,
                 has_pipe_to_interpreter: false,
                 pipe_source_is_remote: false,
+                has_remote_source_to_interpreter: false,
                 parsed: false,
                 error: Some("Failed to parse command".to_string()),
             };
@@ -160,6 +174,7 @@ fn analyze_tree(tree: &Tree, source: &str) -> CommandAnalysis {
             has_pipe_to_shell: false,
             has_pipe_to_interpreter: false,
             pipe_source_is_remote: false,
+            has_remote_source_to_interpreter: false,
             parsed: false,
             error: Some("AST contains parse errors - using fallback".to_string()),
         };
@@ -167,31 +182,37 @@ fn analyze_tree(tree: &Tree, source: &str) -> CommandAnalysis {
 
     let mut commands = Vec::new();
     let mut has_dynamic_command = false;
-    let mut has_pipe_to_shell = false;
-    let mut has_pipe_to_interpreter = false;
-    let mut pipe_source_is_remote = false;
+    let mut flags = PipeFlags::default();
 
     // Traverse all nodes looking for commands and pipelines
     collect_commands(&root, source, &mut commands, &mut has_dynamic_command);
 
     // Check for pipe to shell patterns
-    check_pipelines(
-        &root,
-        source,
-        &mut has_pipe_to_shell,
-        &mut has_pipe_to_interpreter,
-        &mut pipe_source_is_remote,
-    );
+    check_pipelines(&root, source, &mut flags);
 
     CommandAnalysis {
         commands,
         has_dynamic_command,
-        has_pipe_to_shell,
-        has_pipe_to_interpreter,
-        pipe_source_is_remote,
+        has_pipe_to_shell: flags.pipe_to_shell,
+        has_pipe_to_interpreter: flags.pipe_to_interpreter,
+        pipe_source_is_remote: flags.source_is_remote,
+        has_remote_source_to_interpreter: flags.remote_source_to_interpreter,
         parsed: true,
         error: None,
     }
+}
+
+/// Accumulated pipeline classification across all pipeline nodes in a command.
+#[derive(Default)]
+struct PipeFlags {
+    /// Any pipeline sinks into a shell interpreter (broad, always dangerous).
+    pipe_to_shell: bool,
+    /// Any pipeline sinks into a script interpreter (informational).
+    pipe_to_interpreter: bool,
+    /// Any pipeline is sourced from a remote fetcher (informational).
+    source_is_remote: bool,
+    /// Some SINGLE pipeline is remote-sourced AND interpreter-sunk (RCE).
+    remote_source_to_interpreter: bool,
 }
 
 /// Recursively collect all commands from the AST
@@ -386,52 +407,68 @@ fn strip_quotes(s: &str) -> String {
     }
 }
 
-/// Check for pipeline to shell patterns
-fn check_pipelines(
-    node: &Node,
-    source: &str,
-    has_pipe_to_shell: &mut bool,
-    has_pipe_to_interpreter: &mut bool,
-    pipe_source_is_remote: &mut bool,
-) {
+/// Classify each pipeline node and accumulate flags. Source (remote-fetch) and
+/// sink (interpreter) are evaluated PER pipeline so the RCE conjunction can't be
+/// formed across unrelated compound segments; both sides unwrap wrappers.
+fn check_pipelines(node: &Node, source: &str, flags: &mut PipeFlags) {
     if node.kind() == "pipeline" {
-        // Get the commands in the pipeline
         let mut cursor = node.walk();
         let children: Vec<_> = node.children(&mut cursor).collect();
 
-        // Find the last command (the pipe target)
+        // Sink = last command (with wrapper unwrapping: | xargs bash, | env python3).
+        let mut sink_shell = false;
+        let mut sink_interp = false;
         if let Some(last_cmd) = children.iter().rev().find(|c| c.kind() == "command") {
             if let Some(cmd) = extract_command(last_cmd, source) {
-                // Check the command and its arguments for interpreters
-                // This handles cases like: | xargs bash -c, | env sh, etc.
-                check_command_for_interpreters(&cmd, has_pipe_to_shell, has_pipe_to_interpreter);
+                check_command_for_interpreters(&cmd, &mut sink_shell, &mut sink_interp);
             }
         }
 
-        // Find the first command (the pipe source). If it fetches remote content,
-        // piping into an interpreter is RCE; otherwise it's local data processing.
+        // Source = first command (unwrap wrappers so `sudo wget … | ruby` is caught).
+        let mut src_remote = false;
         if let Some(first_cmd) = children.iter().find(|c| c.kind() == "command") {
             if let Some(cmd) = extract_command(first_cmd, source) {
-                let name = cmd.name.to_lowercase();
-                let base = name.rsplit('/').next().unwrap_or(&name);
-                if REMOTE_FETCHERS.contains(base) {
-                    *pipe_source_is_remote = true;
-                }
+                src_remote = command_is_remote_fetcher(&cmd);
             }
         }
+
+        flags.pipe_to_shell |= sink_shell;
+        flags.pipe_to_interpreter |= sink_interp;
+        flags.source_is_remote |= src_remote;
+        // The RCE conjunction, scoped to THIS pipeline.
+        flags.remote_source_to_interpreter |= src_remote && sink_interp;
     }
 
     // Recurse into children
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        check_pipelines(
-            &child,
-            source,
-            has_pipe_to_shell,
-            has_pipe_to_interpreter,
-            pipe_source_is_remote,
-        );
+        check_pipelines(&child, source, flags);
     }
+}
+
+/// Whether a command is (or wraps, via sudo/env/timeout/…) a remote fetcher.
+/// Checks the command name and, for wrapper commands, every argument — mirroring
+/// the sink-side interpreter check so `sudo wget …`, `env FOO=1 curl …`,
+/// `timeout 30 wget …` all resolve to their real fetcher.
+fn command_is_remote_fetcher(cmd: &NormalizedCommand) -> bool {
+    let base = |s: &str| {
+        s.to_lowercase()
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .to_string()
+    };
+    let name = base(&cmd.name);
+    if REMOTE_FETCHERS.contains(name.as_str()) {
+        return true;
+    }
+    if PIPELINE_WRAPPERS.contains(name.as_str()) {
+        return cmd
+            .arguments
+            .iter()
+            .any(|arg| REMOTE_FETCHERS.contains(base(arg).as_str()));
+    }
+    false
 }
 
 /// Check a command (and its arguments) for shell/script interpreters

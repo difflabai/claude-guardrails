@@ -151,6 +151,11 @@ fn is_exfil(id: &str) -> bool {
 /// are never disabled. A disable entry matches the exact pack or its namespace
 /// prefix (`containers` disables `containers.docker`).
 pub fn is_disabled(pack: &str, disabled: &[String]) -> bool {
+    // The unmapped-rule fallback is never disableable, so a future dangerous rule
+    // whose id isn't yet in `pack_of` can't be silently turned off via `["core"]`.
+    if pack == "core.misc" {
+        return false;
+    }
     if ALL_PACKS.iter().any(|p| p.name == pack && p.always_on) {
         return false;
     }

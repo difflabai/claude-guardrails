@@ -49,7 +49,7 @@ pub fn code_for(command: &str) -> String {
             hex(&hasher.finalize())
         }
     };
-    full[..6].to_uppercase()
+    full[..8].to_uppercase()
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -154,7 +154,13 @@ impl AllowOnceStore {
             .filter_map(|g| serde_json::to_string(g).ok())
             .map(|s| s + "\n")
             .collect();
-        std::fs::write(&self.path, body)
+        // Atomic replace (temp + rename) so a concurrent reader never sees a
+        // truncated store. (A read-modify-write lock would additionally close the
+        // lost-update race, but allow-once now only covers low-stakes operational
+        // commands — see OVERRIDABLE_PACKS — so a torn write is the real hazard.)
+        let tmp = self.path.with_extension("jsonl.tmp");
+        std::fs::write(&tmp, body)?;
+        std::fs::rename(&tmp, &self.path)
     }
 
     pub fn path(&self) -> &Path {
@@ -185,7 +191,7 @@ mod tests {
         let a = code_for("rm -rf /tmp/x");
         let b = code_for("rm -rf /tmp/x");
         assert_eq!(a, b);
-        assert_eq!(a.len(), 6);
+        assert_eq!(a.len(), 8);
         assert_ne!(a, code_for("rm -rf /tmp/y"));
     }
 

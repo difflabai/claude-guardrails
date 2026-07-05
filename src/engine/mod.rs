@@ -16,26 +16,36 @@ use crate::rules::allowlist::CompiledAllowlist;
 use regex::RegexSet;
 use std::env;
 
-/// Rule-id prefixes/ids that an allow-once grant must NEVER override. Allow-once
-/// is a UX escape hatch for over-blocking, not a security bypass: self-protection
-/// and catastrophic destruction stay hard-blocked even with a grant (otherwise an
-/// agent could read the code from the denial and self-grant around the boundary).
-const NON_OVERRIDABLE: &[&str] = &[
-    "self-protect",
-    "rm-root",
-    "rm-home",
-    "rm-system",
-    "rm-wildcard",
-    "dd-disk",
-    "mkfs",
-    "fdisk",
-    "fork-bomb",
-    "parse-error",
+/// Packs whose denials an allow-once grant MAY override. Allow-once is a UX escape
+/// hatch for over-blocking *operational* commands, not a security bypass — and the
+/// agent runs both the grant and the command, so anything security-critical must be
+/// unreachable this way. Only non-catastrophic operational packs are overridable;
+/// everything else (catastrophic filesystem, RCE, interpreter exec, secret reads,
+/// exfiltration, self-protection, and any engine-level/unmapped rule) is NOT.
+/// Deriving this from the pack (rather than a hand-maintained rule-id list) means it
+/// can't drift as rules are added.
+const OVERRIDABLE_PACKS: &[&str] = &[
+    "core.git",
+    "core.perms",
+    "containers.docker",
+    "system",
+    "database",
 ];
 
 /// Whether an allow-once grant may override a deny with this rule id.
 pub fn is_overridable(rule_id: &str) -> bool {
-    !NON_OVERRIDABLE.iter().any(|p| rule_id.starts_with(p))
+    OVERRIDABLE_PACKS.contains(&crate::rules::packs::pack_of(rule_id))
+}
+
+/// True if an env var is set to a truthy value (not empty / "0" / "false" / "no").
+fn env_truthy(key: &str) -> bool {
+    match env::var(key) {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no"
+        ),
+        Err(_) => false,
+    }
 }
 
 /// The string an allow-once code is keyed on for a given input: the command for
@@ -112,14 +122,14 @@ impl SecurityEngine {
         }
     }
 
-    /// Check if guardrails are disabled via environment
+    /// Check if guardrails are disabled via environment (truthy value required).
     pub fn is_disabled(&self) -> bool {
-        env::var("GUARDRAILS_DISABLED").is_ok()
+        env_truthy("GUARDRAILS_DISABLED")
     }
 
-    /// Check if warn-only mode is enabled
+    /// Check if warn-only mode is enabled (truthy value required).
     pub fn is_warn_only(&self) -> bool {
-        env::var("GUARDRAILS_WARN_ONLY").is_ok()
+        env_truthy("GUARDRAILS_WARN_ONLY")
     }
 
     /// Main entry point: check an input and return a decision
@@ -137,8 +147,21 @@ impl SecurityEngine {
                 file_path,
                 old_string,
                 new_string,
-            } => selfprotect::check_settings(file_path, Some((old_string, new_string)), None)
-                .unwrap_or_else(|| self.check_file(&input.tool_name, file_path)),
+            } => {
+                if let Some(d) =
+                    selfprotect::check_settings(file_path, Some((old_string, new_string)), None)
+                {
+                    d
+                } else {
+                    let decision = self.check_file(&input.tool_name, file_path);
+                    if decision.is_deny() {
+                        decision
+                    } else {
+                        // Scan the inserted text for live credentials, same as Write.
+                        self.check_content(new_string)
+                    }
+                }
+            }
             ToolInput::Write { file_path, content } => {
                 if let Some(d) = selfprotect::check_settings(file_path, None, Some(content)) {
                     d
@@ -311,5 +334,39 @@ mod tests {
         assert!(engine
             .check_bash("rm ~/.claude/guardrails/claude-guardrails")
             .is_deny());
+    }
+
+    #[test]
+    fn test_allow_once_scope_security() {
+        // C1/H2: allow-once may override operational packs only — never
+        // security-critical denials.
+        assert!(is_overridable("git-reset-hard")); // core.git
+        assert!(is_overridable("chmod-777")); // core.perms
+        assert!(is_overridable("docker-system-prune")); // containers.docker
+        assert!(is_overridable("drop-database")); // database
+        for id in [
+            "rm-root",
+            "rm-boot",
+            "rm-kernel",
+            "rm-rf-star", // H2: previously missing
+            "curl-pipe-sh",
+            "reverse-shell-nc",
+            "python-c-os-system",
+            "eval-variable",
+            "cat-env-file",
+            "env-file",
+            "ssh-private-key",
+            "curl-upload-env",
+            "dev-tcp-write",
+            "self-protect-install",
+            "self-protect-hook",
+            "pipe-remote-to-interpreter",
+            "dynamic-command",
+        ] {
+            assert!(
+                !is_overridable(id),
+                "{id} must not be allow-once-overridable"
+            );
+        }
     }
 }
