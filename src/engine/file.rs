@@ -8,8 +8,14 @@ use crate::rules::secrets;
 
 use regex::RegexSet;
 
-/// Check a file path for security issues
-pub fn check_path(file_path: &str, safety_level: SafetyLevel, rules: &RegexSet) -> Decision {
+/// Check a file path for security issues. `disabled` must match the pack-filter
+/// used to compile `rules`, so match indices map to the correct rule.
+pub fn check_path(
+    file_path: &str,
+    safety_level: SafetyLevel,
+    rules: &RegexSet,
+    disabled: &[String],
+) -> Decision {
     // Normalize the path for matching
     let normalized = normalize_path(file_path);
 
@@ -20,8 +26,8 @@ pub fn check_path(file_path: &str, safety_level: SafetyLevel, rules: &RegexSet) 
         return Decision::allow("file path passed all checks");
     }
 
-    // Get the matching rules
-    let all_rules = secrets::get_secret_patterns_for_level(safety_level);
+    // Get the matching rules (same pack-filtered list used to build `rules`)
+    let all_rules = secrets::active_patterns_for_level(safety_level, disabled);
 
     for idx in matches {
         if idx < all_rules.len() {
@@ -75,21 +81,21 @@ mod tests {
     #[test]
     fn test_env_file_blocked() {
         let rules = compile_rules(SafetyLevel::High);
-        let decision = check_path(".env", SafetyLevel::High, &rules);
+        let decision = check_path(".env", SafetyLevel::High, &rules, &[]);
         assert!(decision.is_deny());
     }
 
     #[test]
     fn test_env_file_with_path_blocked() {
         let rules = compile_rules(SafetyLevel::High);
-        let decision = check_path("/path/to/project/.env", SafetyLevel::High, &rules);
+        let decision = check_path("/path/to/project/.env", SafetyLevel::High, &rules, &[]);
         assert!(decision.is_deny());
     }
 
     #[test]
     fn test_env_example_allowed() {
         let rules = compile_rules(SafetyLevel::High);
-        let decision = check_path(".env.example", SafetyLevel::High, &rules);
+        let decision = check_path(".env.example", SafetyLevel::High, &rules, &[]);
         // .env.example should be allowed (doesn't match .env$)
         assert!(decision.is_allow());
     }
@@ -97,14 +103,14 @@ mod tests {
     #[test]
     fn test_ssh_key_blocked() {
         let rules = compile_rules(SafetyLevel::High);
-        let decision = check_path("/home/user/.ssh/id_rsa", SafetyLevel::High, &rules);
+        let decision = check_path("/home/user/.ssh/id_rsa", SafetyLevel::High, &rules, &[]);
         assert!(decision.is_deny());
     }
 
     #[test]
     fn test_ssh_pub_key_allowed() {
         let rules = compile_rules(SafetyLevel::High);
-        let decision = check_path("/home/user/.ssh/id_rsa.pub", SafetyLevel::High, &rules);
+        let decision = check_path("/home/user/.ssh/id_rsa.pub", SafetyLevel::High, &rules, &[]);
         // Public keys should be allowed (pattern is for private keys)
         assert!(decision.is_allow());
     }
@@ -112,7 +118,12 @@ mod tests {
     #[test]
     fn test_aws_credentials_blocked() {
         let rules = compile_rules(SafetyLevel::High);
-        let decision = check_path("/home/user/.aws/credentials", SafetyLevel::High, &rules);
+        let decision = check_path(
+            "/home/user/.aws/credentials",
+            SafetyLevel::High,
+            &rules,
+            &[],
+        );
         assert!(decision.is_deny());
     }
 
@@ -120,34 +131,44 @@ mod tests {
     fn test_normal_file_allowed() {
         let rules = compile_rules(SafetyLevel::High);
 
-        let decision = check_path("README.md", SafetyLevel::High, &rules);
+        let decision = check_path("README.md", SafetyLevel::High, &rules, &[]);
         assert!(decision.is_allow());
 
-        let decision = check_path("/path/to/project/src/main.rs", SafetyLevel::High, &rules);
+        let decision = check_path(
+            "/path/to/project/src/main.rs",
+            SafetyLevel::High,
+            &rules,
+            &[],
+        );
         assert!(decision.is_allow());
 
-        let decision = check_path("package.json", SafetyLevel::High, &rules);
+        let decision = check_path("package.json", SafetyLevel::High, &rules, &[]);
         assert!(decision.is_allow());
     }
 
     #[test]
     fn test_pem_file_blocked() {
         let rules = compile_rules(SafetyLevel::High);
-        let decision = check_path("/path/to/server.pem", SafetyLevel::High, &rules);
+        let decision = check_path("/path/to/server.pem", SafetyLevel::High, &rules, &[]);
         assert!(decision.is_deny());
     }
 
     #[test]
     fn test_kube_config_blocked() {
         let rules = compile_rules(SafetyLevel::High);
-        let decision = check_path("/home/user/.kube/config", SafetyLevel::High, &rules);
+        let decision = check_path("/home/user/.kube/config", SafetyLevel::High, &rules, &[]);
         assert!(decision.is_deny());
     }
 
     #[test]
     fn test_docker_config_blocked() {
         let rules = compile_rules(SafetyLevel::High);
-        let decision = check_path("/home/user/.docker/config.json", SafetyLevel::High, &rules);
+        let decision = check_path(
+            "/home/user/.docker/config.json",
+            SafetyLevel::High,
+            &rules,
+            &[],
+        );
         assert!(decision.is_deny());
     }
 

@@ -184,6 +184,17 @@ pub fn get_secret_patterns_for_level(level: SafetyLevel) -> Vec<&'static Rule> {
     rules
 }
 
+/// Secret patterns active for `level` after removing disabled packs. Order-
+/// preserving vs `get_secret_patterns_for_level`; equals it when `disabled` is
+/// empty. (The `secrets.files` pack is always-on, so this only changes if a
+/// future secrets pack is made toggleable.)
+pub fn active_patterns_for_level(level: SafetyLevel, disabled: &[String]) -> Vec<&'static Rule> {
+    get_secret_patterns_for_level(level)
+        .into_iter()
+        .filter(|r| !crate::rules::packs::is_disabled(crate::rules::packs::pack_of(r.id), disabled))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

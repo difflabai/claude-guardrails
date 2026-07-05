@@ -2,8 +2,8 @@
 //!
 //! Provides utilities for tokenizing and analyzing shell commands.
 
-use regex::Regex;
 use once_cell::sync::Lazy;
+use regex::Regex;
 
 /// Check if a command contains variable-based command execution
 /// Detects: $cmd, ${cmd}, $(cmd), `cmd`
@@ -107,12 +107,13 @@ pub fn get_base_command(command: &str) -> Option<String> {
 /// Returns individual commands for separate analysis
 pub fn split_compound_command(command: &str) -> Vec<String> {
     // Simple splitting - doesn't handle quoted strings perfectly but good enough
-    static SPLIT_PATTERN: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r"\s*(;|&&|\|\|)\s*").unwrap()
-    });
+    static SPLIT_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s*(;|&&|\|\|)\s*").unwrap());
 
     // Don't split on single pipe (|) as that's for piping, not command separation
-    SPLIT_PATTERN.split(command).map(|s| s.to_string()).collect()
+    SPLIT_PATTERN
+        .split(command)
+        .map(|s| s.to_string())
+        .collect()
 }
 
 #[cfg(test)]

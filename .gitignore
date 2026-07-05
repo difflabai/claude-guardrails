@@ -20,3 +20,6 @@ guard.sh
 test.sh
 uninstall.sh
 patterns/
+
+# Fleet servitor scaffolding (not part of the guardrail code)
+.servitor/

@@ -169,9 +169,7 @@ mod tests {
         let allowlist = CompiledAllowlist::from_config(&config).unwrap();
 
         // Should match bash command
-        assert!(allowlist
-            .matches("Bash", "rm -rf ./node_modules")
-            .is_some());
+        assert!(allowlist.matches("Bash", "rm -rf ./node_modules").is_some());
 
         // Should not match read for bash pattern
         assert!(allowlist.matches("Read", "rm -rf ./node_modules").is_none());

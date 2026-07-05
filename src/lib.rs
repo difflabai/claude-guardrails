@@ -27,12 +27,16 @@
 //! assert!(decision.is_deny());
 //! ```
 
+pub mod allowonce;
 pub mod audit;
 pub mod config;
+pub mod doctor;
 pub mod engine;
+pub mod explain;
 pub mod input;
 pub mod output;
 pub mod parser;
+pub mod replay;
 pub mod rules;
 
 // Re-exports for convenience

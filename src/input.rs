@@ -35,9 +35,7 @@ pub enum ToolInput {
     },
 
     /// File read operation
-    Read {
-        file_path: String,
-    },
+    Read { file_path: String },
 
     /// File edit operation
     Edit {
@@ -47,15 +45,10 @@ pub enum ToolInput {
     },
 
     /// File write operation
-    Write {
-        file_path: String,
-        content: String,
-    },
+    Write { file_path: String, content: String },
 
     /// Unknown tool - pass through
-    Unknown {
-        raw: serde_json::Value,
-    },
+    Unknown { raw: serde_json::Value },
 }
 
 impl<'de> Deserialize<'de> for ToolInput {
@@ -72,7 +65,10 @@ impl<'de> Deserialize<'de> for ToolInput {
             if let Some(command) = obj.get("command").and_then(|v| v.as_str()) {
                 return Ok(ToolInput::Bash {
                     command: command.to_string(),
-                    description: obj.get("description").and_then(|v| v.as_str()).map(String::from),
+                    description: obj
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
                     timeout: obj.get("timeout").and_then(|v| v.as_u64()),
                 });
             }
@@ -117,22 +113,37 @@ impl HookInput {
         serde_json::from_str(json)
     }
 
-    /// Get a summary of the input for logging
+    /// Get a short, human-readable summary of the input for logging.
+    /// Bash commands are truncated on a UTF-8 char boundary (never mid-codepoint).
     pub fn summary(&self) -> String {
         match &self.tool_input {
             ToolInput::Bash { command, .. } => {
-                let truncated = if command.len() > 100 {
-                    format!("{}...", &command[..100])
-                } else {
-                    command.clone()
-                };
-                format!("Bash: {}", truncated)
+                format!("Bash: {}", truncate_chars(command, 100))
             }
             ToolInput::Read { file_path } => format!("Read: {}", file_path),
             ToolInput::Edit { file_path, .. } => format!("Edit: {}", file_path),
             ToolInput::Write { file_path, .. } => format!("Write: {}", file_path),
             ToolInput::Unknown { .. } => format!("Unknown tool: {}", self.tool_name),
         }
+    }
+
+    /// The full, untruncated Bash command, if this is a Bash invocation. Logged
+    /// so `replay` can faithfully re-evaluate long commands that `summary()` cuts.
+    pub fn full_command(&self) -> Option<&str> {
+        match &self.tool_input {
+            ToolInput::Bash { command, .. } => Some(command),
+            _ => None,
+        }
+    }
+}
+
+/// Truncate to at most `max` characters (not bytes), appending `...` if cut.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        let head: String = s.chars().take(max).collect();
+        format!("{}...", head)
+    } else {
+        s.to_string()
     }
 }
 

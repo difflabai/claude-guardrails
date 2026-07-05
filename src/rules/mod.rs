@@ -5,6 +5,7 @@
 pub mod allowlist;
 pub mod dangerous;
 pub mod exfiltration;
+pub mod packs;
 pub mod secrets;
 
 use crate::config::SafetyLevel;

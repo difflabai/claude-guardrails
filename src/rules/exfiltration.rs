@@ -188,6 +188,21 @@ pub fn get_exfiltration_rules() -> &'static [Rule] {
     EXFILTRATION_RULES
 }
 
+/// Exfiltration rules active for `level` after removing disabled packs. Filters
+/// by safety level and pack in one pass, order-preserving. The `exfil` pack is
+/// always-on, so with `disabled` empty (or any value) this equals the prior
+/// `get_exfiltration_rules().filter(level.includes)` used at both call sites.
+pub fn active_rules_for_level(
+    level: crate::config::SafetyLevel,
+    disabled: &[String],
+) -> Vec<&'static Rule> {
+    EXFILTRATION_RULES
+        .iter()
+        .filter(|r| level.includes(r.level))
+        .filter(|r| !crate::rules::packs::is_disabled(crate::rules::packs::pack_of(r.id), disabled))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
