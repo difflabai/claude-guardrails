@@ -463,12 +463,27 @@ fn command_is_remote_fetcher(cmd: &NormalizedCommand) -> bool {
         return true;
     }
     if PIPELINE_WRAPPERS.contains(name.as_str()) {
-        return cmd
+        // Resolve the wrapped command: the first argument that is not a flag, a
+        // `KEY=VAL` env assignment, or a numeric duration operand (timeout/nice),
+        // then test only THAT token. Scanning every argument would over-fire on a
+        // fetcher word appearing as data (`nice grep http log | ruby`).
+        if let Some(inner) = cmd
             .arguments
             .iter()
-            .any(|arg| REMOTE_FETCHERS.contains(base(arg).as_str()));
+            .find(|a| !a.starts_with('-') && !a.contains('=') && !is_duration(a))
+        {
+            return REMOTE_FETCHERS.contains(base(inner).as_str());
+        }
     }
     false
+}
+
+/// Whether a token is a bare numeric duration operand (`30`, `30s`, `5m`, `1h`),
+/// as consumed by `timeout`/`nice` — so it's skipped when resolving the wrapped
+/// command rather than mistaken for it.
+fn is_duration(s: &str) -> bool {
+    let digits = s.trim_end_matches(['s', 'm', 'h', 'd']);
+    !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
 }
 
 /// Check a command (and its arguments) for shell/script interpreters
