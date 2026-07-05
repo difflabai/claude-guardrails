@@ -5,7 +5,9 @@
 pub mod bash;
 pub mod common;
 pub mod file;
+pub mod selfprotect;
 
+use crate::allowonce::AllowOnceStore;
 use crate::config::{Config, SafetyLevel};
 use crate::input::{HookInput, ToolInput};
 use crate::output::Decision;
@@ -13,6 +15,40 @@ use crate::rules::allowlist::CompiledAllowlist;
 
 use regex::RegexSet;
 use std::env;
+
+/// Rule-id prefixes/ids that an allow-once grant must NEVER override. Allow-once
+/// is a UX escape hatch for over-blocking, not a security bypass: self-protection
+/// and catastrophic destruction stay hard-blocked even with a grant (otherwise an
+/// agent could read the code from the denial and self-grant around the boundary).
+const NON_OVERRIDABLE: &[&str] = &[
+    "self-protect",
+    "rm-root",
+    "rm-home",
+    "rm-system",
+    "rm-wildcard",
+    "dd-disk",
+    "mkfs",
+    "fdisk",
+    "fork-bomb",
+    "parse-error",
+];
+
+/// Whether an allow-once grant may override a deny with this rule id.
+pub fn is_overridable(rule_id: &str) -> bool {
+    !NON_OVERRIDABLE.iter().any(|p| rule_id.starts_with(p))
+}
+
+/// The string an allow-once code is keyed on for a given input: the command for
+/// Bash, the file path for file tools. Must match what the CLI shows on denial.
+pub fn allow_once_subject(input: &HookInput) -> Option<String> {
+    match &input.tool_input {
+        ToolInput::Bash { command, .. } => Some(command.clone()),
+        ToolInput::Read { file_path }
+        | ToolInput::Edit { file_path, .. }
+        | ToolInput::Write { file_path, .. } => Some(format!("{}:{}", input.tool_name, file_path)),
+        ToolInput::Unknown { .. } => None,
+    }
+}
 
 /// The main security engine
 pub struct SecurityEngine {
@@ -28,28 +64,30 @@ impl SecurityEngine {
     /// Create a new security engine with the given configuration
     pub fn new(config: Config) -> Self {
         let safety_level = config.general.safety_level;
+        let disabled = &config.packs.disabled;
 
-        // Compile bash rules
-        let bash_patterns: Vec<&str> = crate::rules::dangerous::get_rules_for_level(safety_level)
-            .iter()
-            .map(|r| r.pattern)
-            .collect();
+        // Compile bash rules (pack-filtered; order preserved for index alignment)
+        let bash_patterns: Vec<&str> =
+            crate::rules::dangerous::active_rules_for_level(safety_level, disabled)
+                .iter()
+                .map(|r| r.pattern)
+                .collect();
         let bash_rules = RegexSet::new(&bash_patterns).unwrap_or_else(|_| RegexSet::empty());
 
         // Compile file rules
         let file_patterns: Vec<&str> =
-            crate::rules::secrets::get_secret_patterns_for_level(safety_level)
+            crate::rules::secrets::active_patterns_for_level(safety_level, disabled)
                 .iter()
                 .map(|r| r.pattern)
                 .collect();
         let file_rules = RegexSet::new(&file_patterns).unwrap_or_else(|_| RegexSet::empty());
 
         // Compile exfiltration rules
-        let exfil_patterns: Vec<&str> = crate::rules::exfiltration::get_exfiltration_rules()
-            .iter()
-            .filter(|r| safety_level.includes(r.level))
-            .map(|r| r.pattern)
-            .collect();
+        let exfil_patterns: Vec<&str> =
+            crate::rules::exfiltration::active_rules_for_level(safety_level, disabled)
+                .iter()
+                .map(|r| r.pattern)
+                .collect();
         let exfil_rules = RegexSet::new(&exfil_patterns).unwrap_or_else(|_| RegexSet::empty());
 
         // Load allowlist if configured
@@ -95,10 +133,30 @@ impl SecurityEngine {
         let decision = match &input.tool_input {
             ToolInput::Bash { command, .. } => self.check_bash(command),
             ToolInput::Read { file_path } => self.check_file(&input.tool_name, file_path),
-            ToolInput::Edit { file_path, .. } => self.check_file(&input.tool_name, file_path),
-            ToolInput::Write { file_path, .. } => self.check_file(&input.tool_name, file_path),
+            ToolInput::Edit {
+                file_path,
+                old_string,
+                new_string,
+            } => selfprotect::check_settings(file_path, Some((old_string, new_string)), None)
+                .unwrap_or_else(|| self.check_file(&input.tool_name, file_path)),
+            ToolInput::Write { file_path, content } => {
+                if let Some(d) = selfprotect::check_settings(file_path, None, Some(content)) {
+                    d
+                } else {
+                    let decision = self.check_file(&input.tool_name, file_path);
+                    if decision.is_deny() {
+                        decision
+                    } else {
+                        self.check_content(content)
+                    }
+                }
+            }
             ToolInput::Unknown { .. } => Decision::allow("unknown tool type - passing through"),
         };
+
+        // Allow-once escape hatch: a granted one-shot exception overrides an
+        // overridable deny (never self-protection or catastrophic rules).
+        let decision = self.apply_allow_once(input, decision);
 
         // If warn-only mode, convert denies to warnings
         if self.is_warn_only() {
@@ -112,6 +170,12 @@ impl SecurityEngine {
 
     /// Check a bash command
     pub fn check_bash(&self, command: &str) -> Decision {
+        // Self-protection runs first and is not allowlist-overridable: tampering
+        // with the guardrail's own settings or binary is always denied.
+        if let Some(decision) = selfprotect::check_bash(command) {
+            return decision;
+        }
+
         // Check allowlist first
         if let Some(reason) = self.allowlist.matches("Bash", command) {
             return Decision::allow(format!("allowlisted: {}", reason));
@@ -129,13 +193,53 @@ impl SecurityEngine {
 
     /// Check a file operation
     pub fn check_file(&self, tool: &str, file_path: &str) -> Decision {
+        // Self-protection of the install runs first and is not allowlist-overridable.
+        if let Some(decision) = selfprotect::check_install(tool, file_path) {
+            return decision;
+        }
+
         // Check allowlist first
         if let Some(reason) = self.allowlist.matches(tool, file_path) {
             return Decision::allow(format!("allowlisted: {}", reason));
         }
 
         // Use the file-specific checker
-        file::check_path(file_path, self.safety_level, &self.file_rules)
+        file::check_path(
+            file_path,
+            self.safety_level,
+            &self.file_rules,
+            &self.config.packs.disabled,
+        )
+    }
+
+    /// Apply an allow-once grant, if one covers this input and the deny is
+    /// overridable. Consumes the grant on match.
+    fn apply_allow_once(&self, input: &HookInput, decision: Decision) -> Decision {
+        let Decision::Deny { rule_id, .. } = &decision else {
+            return decision;
+        };
+        if !is_overridable(rule_id) {
+            return decision;
+        }
+        let Some(subject) = allow_once_subject(input) else {
+            return decision;
+        };
+        let store = AllowOnceStore::new(AllowOnceStore::default_path());
+        if store.check_and_consume(&subject) {
+            return Decision::allow("allow-once grant consumed");
+        }
+        decision
+    }
+
+    /// Check file content being written for embedded live credentials.
+    pub fn check_content(&self, content: &str) -> Decision {
+        if common::contains_secret(content) {
+            return Decision::deny(
+                "secret-in-content",
+                "Writing a live credential (API key or private key) into file content is blocked",
+            );
+        }
+        Decision::allow("content passed all checks")
     }
 
     /// Get the current safety level
@@ -183,5 +287,29 @@ mod tests {
         let engine = test_engine();
         let decision = engine.check_file("Read", "/path/to/README.md");
         assert!(decision.is_allow());
+    }
+
+    #[test]
+    fn test_write_content_with_secret_blocked() {
+        let engine = test_engine();
+        let decision =
+            engine.check_content("client = Anthropic(api_key='sk-ant-api03-AbCdEf0123456789xyz')");
+        assert!(decision.is_deny());
+        assert_eq!(decision.rule_id(), Some("secret-in-content"));
+    }
+
+    #[test]
+    fn test_write_content_clean_allowed() {
+        let engine = test_engine();
+        let decision = engine.check_content("fn main() { println!(\"hello\"); }");
+        assert!(decision.is_allow());
+    }
+
+    #[test]
+    fn test_self_protection_bash() {
+        let engine = test_engine();
+        assert!(engine
+            .check_bash("rm ~/.claude/guardrails/claude-guardrails")
+            .is_deny());
     }
 }

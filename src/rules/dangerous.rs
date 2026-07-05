@@ -367,6 +367,16 @@ pub fn get_rules_for_level(level: SafetyLevel) -> Vec<&'static Rule> {
     rules
 }
 
+/// Rules active for `level` after removing disabled packs. Preserves the order
+/// of [`get_rules_for_level`], so the compiled RegexSet and the index→rule
+/// lookup stay aligned. With `disabled` empty this equals `get_rules_for_level`.
+pub fn active_rules_for_level(level: SafetyLevel, disabled: &[String]) -> Vec<&'static Rule> {
+    get_rules_for_level(level)
+        .into_iter()
+        .filter(|r| !crate::rules::packs::is_disabled(crate::rules::packs::pack_of(r.id), disabled))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,7 +390,12 @@ mod tests {
             .chain(STRICT_RULES.iter())
         {
             let result = Regex::new(rule.pattern);
-            assert!(result.is_ok(), "Rule {} has invalid pattern: {}", rule.id, rule.pattern);
+            assert!(
+                result.is_ok(),
+                "Rule {} has invalid pattern: {}",
+                rule.id,
+                rule.pattern
+            );
         }
     }
 
@@ -435,7 +450,8 @@ mod tests {
 
     #[test]
     fn test_python_c_os_system_matches() {
-        let re = Regex::new(r#"\bpython[23]?\s+-c\s+['"].*\b(os\.system|subprocess|exec|eval)\b"#).unwrap();
+        let re = Regex::new(r#"\bpython[23]?\s+-c\s+['"].*\b(os\.system|subprocess|exec|eval)\b"#)
+            .unwrap();
         assert!(re.is_match("python -c 'import os; os.system(\"id\")'"));
         assert!(re.is_match("python3 -c \"import subprocess\""));
         assert!(re.is_match("python -c 'eval(user_input)'"));
@@ -451,7 +467,8 @@ mod tests {
 
     #[test]
     fn test_node_e_exec_matches() {
-        let re = Regex::new(r#"\bnode\s+(-e|--eval)\s+['"].*\b(exec|spawn|child_process)"#).unwrap();
+        let re =
+            Regex::new(r#"\bnode\s+(-e|--eval)\s+['"].*\b(exec|spawn|child_process)"#).unwrap();
         assert!(re.is_match("node -e 'require(\"child_process\").exec(\"id\")'"));
         assert!(re.is_match("node --eval \"const {spawn} = require('child_process')\""));
     }

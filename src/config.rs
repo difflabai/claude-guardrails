@@ -32,8 +32,8 @@ impl SafetyLevel {
         }
     }
 
-    /// Parse from string
-    pub fn from_str(s: &str) -> Option<Self> {
+    /// Parse a safety level from its string name
+    pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "critical" => Some(SafetyLevel::Critical),
             "high" => Some(SafetyLevel::High),
@@ -55,6 +55,12 @@ pub struct GeneralConfig {
 
     /// Path to audit log file
     pub audit_path: Option<String>,
+
+    /// Rotate the audit log once it exceeds this many bytes (0 disables).
+    pub audit_max_bytes: u64,
+
+    /// Number of rotated generations to keep (`audit.jsonl.1` … `.N`).
+    pub audit_keep: usize,
 }
 
 impl Default for GeneralConfig {
@@ -63,6 +69,8 @@ impl Default for GeneralConfig {
             safety_level: SafetyLevel::High,
             audit_log: true,
             audit_path: Some("~/.claude/guardrails/audit.jsonl".to_string()),
+            audit_max_bytes: 25 * 1024 * 1024,
+            audit_keep: 5,
         }
     }
 }
@@ -110,6 +118,54 @@ impl Default for BashConfig {
     }
 }
 
+/// Fleet-specific configuration
+///
+/// Encodes trusted context so known-safe idioms don't trip generic rules.
+/// This is the v2 cure for the "guardrail blocks the fleet's own protocol"
+/// false-positive class (e.g. `eval "$(fleetops session-stamp cic)"`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct FleetConfig {
+    /// Command-substitution generators that are trusted inside `eval`/assignment.
+    /// `eval "$(<gen> ...)"` where `<gen>` is listed here is allowed; any other
+    /// generator inside an eval keeps tripping the eval-injection rule.
+    pub trusted_generators: Vec<String>,
+}
+
+impl Default for FleetConfig {
+    fn default() -> Self {
+        Self {
+            trusted_generators: vec![
+                "fleetops".to_string(),
+                "direnv".to_string(),
+                "brew".to_string(),
+                "pyenv".to_string(),
+                "rbenv".to_string(),
+                "nodenv".to_string(),
+                "mise".to_string(),
+                "asdf".to_string(),
+                "starship".to_string(),
+                "zoxide".to_string(),
+                "atuin".to_string(),
+                "thefuck".to_string(),
+                "rtx".to_string(),
+            ],
+        }
+    }
+}
+
+/// Security-pack configuration. Rules are grouped into namespaced packs
+/// (`core.filesystem`, `containers.docker`, `database`, …). By default every
+/// pack is active; listing a pack (or a namespace prefix like `containers`) in
+/// `disabled` turns it off. Always-on packs (catastrophic protection) ignore
+/// this and cannot be disabled.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct PacksConfig {
+    /// Pack names or namespace prefixes to disable.
+    pub disabled: Vec<String>,
+}
+
 /// File operation configuration
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -148,6 +204,8 @@ pub struct Config {
     pub overrides: OverrideConfig,
     pub bash: BashConfig,
     pub files: FilesConfig,
+    pub fleet: FleetConfig,
+    pub packs: PacksConfig,
 }
 
 impl Config {
@@ -187,9 +245,9 @@ impl Config {
 
     /// Expand ~ in path strings
     pub fn expand_path(path: &str) -> PathBuf {
-        if path.starts_with("~/") {
+        if let Some(rest) = path.strip_prefix("~/") {
             if let Some(home) = dirs::home_dir() {
-                return home.join(&path[2..]);
+                return home.join(rest);
             }
         }
         PathBuf::from(path)
@@ -197,7 +255,10 @@ impl Config {
 
     /// Get the audit log path (expanded)
     pub fn audit_path(&self) -> Option<PathBuf> {
-        self.general.audit_path.as_ref().map(|p| Self::expand_path(p))
+        self.general
+            .audit_path
+            .as_ref()
+            .map(|p| Self::expand_path(p))
     }
 
     /// Get the allowlist file path (expanded)

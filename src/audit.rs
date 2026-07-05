@@ -38,8 +38,12 @@ pub struct AuditEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rule_id: Option<String>,
 
-    /// Summary of the input
+    /// Summary of the input (truncated, human-readable)
     pub input_summary: String,
+
+    /// Full untruncated Bash command, when applicable — for faithful replay.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
 
     /// Reason for the decision
     pub reason: String,
@@ -72,6 +76,7 @@ impl AuditEntry {
             tool: input.tool_name.clone(),
             rule_id,
             input_summary: input.summary(),
+            command: input.full_command().map(str::to_string),
             reason,
             session_id: input.session_id.clone(),
         }
@@ -84,12 +89,26 @@ pub struct AuditLogger {
 }
 
 impl AuditLogger {
-    /// Create a new audit logger
+    /// Create a new audit logger with default rotation (25 MB, keep 5).
     pub fn new(path: Option<&Path>) -> Self {
+        Self::with_rotation(path, 25 * 1024 * 1024, 5)
+    }
+
+    /// Create a logger that rotates the log when it exceeds `max_bytes`, keeping
+    /// `keep` rotated generations (`audit.jsonl.1` … `audit.jsonl.{keep}`).
+    pub fn with_rotation(path: Option<&Path>, max_bytes: u64, keep: usize) -> Self {
         let writer = path.and_then(|p| {
-            // Ensure parent directory exists
             if let Some(parent) = p.parent() {
                 let _ = std::fs::create_dir_all(parent);
+            }
+
+            // Rotate before opening if the current log is over the cap.
+            if max_bytes > 0 {
+                if let Ok(meta) = std::fs::metadata(p) {
+                    if meta.len() > max_bytes {
+                        rotate(p, keep);
+                    }
+                }
             }
 
             OpenOptions::new()
@@ -128,6 +147,26 @@ impl AuditLogger {
     pub fn is_enabled(&self) -> bool {
         self.writer.is_some()
     }
+}
+
+/// Rotate `path` → `path.1` → … → `path.{keep}`, dropping the oldest.
+fn rotate(path: &Path, keep: usize) {
+    if keep == 0 {
+        // No generations kept: just truncate by removing the current log.
+        let _ = std::fs::remove_file(path);
+        return;
+    }
+    let gen = |i: usize| path.with_extension(format!("jsonl.{}", i));
+    // Drop the oldest generation.
+    let _ = std::fs::remove_file(gen(keep));
+    // Shift .{i} → .{i+1} from oldest-but-one down to 1.
+    for i in (1..keep).rev() {
+        if gen(i).exists() {
+            let _ = std::fs::rename(gen(i), gen(i + 1));
+        }
+    }
+    // Current log → .1
+    let _ = std::fs::rename(path, gen(1));
 }
 
 /// Create a disabled logger (for when audit logging is off)
@@ -212,5 +251,51 @@ mod tests {
         let decision = Decision::allow("test");
         // Should not error even when disabled
         logger.log_decision(&input, &decision, false).unwrap();
+    }
+
+    #[test]
+    fn test_audit_entry_carries_full_command() {
+        let input = test_input(); // Bash: rm -rf /
+        let entry = AuditEntry::new(&input, &Decision::allow("x"), false);
+        assert_eq!(entry.command.as_deref(), Some("rm -rf /"));
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("\"command\":\"rm -rf /\""));
+    }
+
+    #[test]
+    fn test_rotation_shifts_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+
+        // Write an oversized log, then open with a tiny cap to force rotation.
+        std::fs::write(&path, "x".repeat(2048)).unwrap();
+        let mut logger = AuditLogger::with_rotation(Some(&path), 1024, 3);
+        logger
+            .log_decision(&test_input(), &Decision::allow("fresh"), false)
+            .unwrap();
+
+        // Old content moved to .1; current log is the fresh (small) one.
+        let rotated = path.with_extension("jsonl.1");
+        assert!(rotated.exists(), "generation .1 should exist");
+        assert_eq!(std::fs::read_to_string(&rotated).unwrap().len(), 2048);
+        assert!(std::fs::read_to_string(&path).unwrap().contains("fresh"));
+    }
+
+    #[test]
+    fn test_rotation_drops_oldest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        // Seed the max generation, which must be dropped on rotate.
+        std::fs::write(path.with_extension("jsonl.2"), "oldest").unwrap();
+        std::fs::write(&path, "y".repeat(2048)).unwrap();
+
+        let _ = AuditLogger::with_rotation(Some(&path), 1024, 2);
+        // keep=2: .2 dropped, old current → .1
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("jsonl.1"))
+                .unwrap()
+                .len(),
+            2048
+        );
     }
 }

@@ -10,9 +10,23 @@ use tree_sitter::{Node, Parser, Tree};
 /// Shell interpreters that are dangerous when used as pipe targets
 static SHELL_INTERPRETERS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
     [
-        "sh", "bash", "zsh", "dash", "ksh", "csh", "tcsh", "fish",
-        "/bin/sh", "/bin/bash", "/bin/zsh", "/bin/dash", "/bin/ksh",
-        "/usr/bin/sh", "/usr/bin/bash", "/usr/bin/zsh", "/usr/bin/env",
+        "sh",
+        "bash",
+        "zsh",
+        "dash",
+        "ksh",
+        "csh",
+        "tcsh",
+        "fish",
+        "/bin/sh",
+        "/bin/bash",
+        "/bin/zsh",
+        "/bin/dash",
+        "/bin/ksh",
+        "/usr/bin/sh",
+        "/usr/bin/bash",
+        "/usr/bin/zsh",
+        "/usr/bin/env",
     ]
     .into_iter()
     .collect()
@@ -21,8 +35,21 @@ static SHELL_INTERPRETERS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
 /// Wrapper commands that can execute other commands (for pipeline unwrapping)
 static PIPELINE_WRAPPERS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
     [
-        "xargs", "env", "sudo", "timeout", "nice", "nohup",
-        "ionice", "strace", "time", "unbuffer", "watch",
+        "xargs", "env", "sudo", "timeout", "nice", "nohup", "ionice", "strace", "time", "unbuffer",
+        "watch",
+    ]
+    .into_iter()
+    .collect()
+});
+
+/// Commands that fetch remote content. When one of these is the *source* of a
+/// pipeline feeding an interpreter, it's remote-code-execution (`curl … | python3`).
+/// When the source is a local command, piping to an interpreter is ordinary data
+/// processing (`fleetops state show | python3 -c '…'`) and must not be blocked.
+static REMOTE_FETCHERS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
+    [
+        "curl", "wget", "nc", "ncat", "netcat", "fetch", "ssh", "scp", "sftp", "ftp", "http",
+        "https", "httpie", "aria2c", "socat",
     ]
     .into_iter()
     .collect()
@@ -31,9 +58,18 @@ static PIPELINE_WRAPPERS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
 /// Script interpreters (also dangerous as pipe targets)
 static SCRIPT_INTERPRETERS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
     [
-        "python", "python2", "python3", "ruby", "perl", "node", "php",
-        "/usr/bin/python", "/usr/bin/python3", "/usr/bin/ruby",
-        "/usr/bin/perl", "/usr/bin/node",
+        "python",
+        "python2",
+        "python3",
+        "ruby",
+        "perl",
+        "node",
+        "php",
+        "/usr/bin/python",
+        "/usr/bin/python3",
+        "/usr/bin/ruby",
+        "/usr/bin/perl",
+        "/usr/bin/node",
     ]
     .into_iter()
     .collect()
@@ -50,6 +86,9 @@ pub struct CommandAnalysis {
     pub has_pipe_to_shell: bool,
     /// Whether there's a pipeline to a script interpreter
     pub has_pipe_to_interpreter: bool,
+    /// Whether a pipeline feeding an interpreter is sourced from remote content
+    /// (`curl … | python3`). Distinguishes RCE from local data processing.
+    pub pipe_source_is_remote: bool,
     /// Raw AST parse succeeded
     pub parsed: bool,
     /// Error message if parsing failed
@@ -74,12 +113,16 @@ pub fn analyze_command(source: &str) -> CommandAnalysis {
     let mut parser = Parser::new();
 
     // Set the bash language
-    if parser.set_language(&tree_sitter_bash::LANGUAGE.into()).is_err() {
+    if parser
+        .set_language(&tree_sitter_bash::LANGUAGE.into())
+        .is_err()
+    {
         return CommandAnalysis {
             commands: vec![],
             has_dynamic_command: false,
             has_pipe_to_shell: false,
             has_pipe_to_interpreter: false,
+            pipe_source_is_remote: false,
             parsed: false,
             error: Some("Failed to load tree-sitter-bash language".to_string()),
         };
@@ -93,6 +136,7 @@ pub fn analyze_command(source: &str) -> CommandAnalysis {
                 has_dynamic_command: false,
                 has_pipe_to_shell: false,
                 has_pipe_to_interpreter: false,
+                pipe_source_is_remote: false,
                 parsed: false,
                 error: Some("Failed to parse command".to_string()),
             };
@@ -115,6 +159,7 @@ fn analyze_tree(tree: &Tree, source: &str) -> CommandAnalysis {
             has_dynamic_command: false,
             has_pipe_to_shell: false,
             has_pipe_to_interpreter: false,
+            pipe_source_is_remote: false,
             parsed: false,
             error: Some("AST contains parse errors - using fallback".to_string()),
         };
@@ -124,18 +169,26 @@ fn analyze_tree(tree: &Tree, source: &str) -> CommandAnalysis {
     let mut has_dynamic_command = false;
     let mut has_pipe_to_shell = false;
     let mut has_pipe_to_interpreter = false;
+    let mut pipe_source_is_remote = false;
 
     // Traverse all nodes looking for commands and pipelines
     collect_commands(&root, source, &mut commands, &mut has_dynamic_command);
 
     // Check for pipe to shell patterns
-    check_pipelines(&root, source, &mut has_pipe_to_shell, &mut has_pipe_to_interpreter);
+    check_pipelines(
+        &root,
+        source,
+        &mut has_pipe_to_shell,
+        &mut has_pipe_to_interpreter,
+        &mut pipe_source_is_remote,
+    );
 
     CommandAnalysis {
         commands,
         has_dynamic_command,
         has_pipe_to_shell,
         has_pipe_to_interpreter,
+        pipe_source_is_remote,
         parsed: true,
         error: None,
     }
@@ -183,8 +236,15 @@ fn extract_command(node: &Node, source: &str) -> Option<NormalizedCommand> {
                 command_name_node = Some(child);
                 in_args = true;
             }
-            "word" | "string" | "raw_string" | "concatenation"
-            | "simple_expansion" | "expansion" | "command_substitution" if in_args => {
+            "word"
+            | "string"
+            | "raw_string"
+            | "concatenation"
+            | "simple_expansion"
+            | "expansion"
+            | "command_substitution"
+                if in_args =>
+            {
                 if let Ok(text) = child.utf8_text(source.as_bytes()) {
                     arguments.push(normalize_word(&child, source));
                     let _ = text; // Silence warning
@@ -288,6 +348,7 @@ fn normalize_concatenation(node: &Node, source: &str) -> String {
 }
 
 /// Check if a node contains dynamic parts (variables, command substitution)
+#[allow(clippy::only_used_in_recursion)]
 fn has_dynamic_parts(node: &Node, source: &str) -> bool {
     match node.kind() {
         "simple_expansion" | "expansion" | "command_substitution" => true,
@@ -331,22 +392,31 @@ fn check_pipelines(
     source: &str,
     has_pipe_to_shell: &mut bool,
     has_pipe_to_interpreter: &mut bool,
+    pipe_source_is_remote: &mut bool,
 ) {
     if node.kind() == "pipeline" {
-        // Get the last command in the pipeline
+        // Get the commands in the pipeline
         let mut cursor = node.walk();
         let children: Vec<_> = node.children(&mut cursor).collect();
 
-        // Find the last command
+        // Find the last command (the pipe target)
         if let Some(last_cmd) = children.iter().rev().find(|c| c.kind() == "command") {
             if let Some(cmd) = extract_command(last_cmd, source) {
                 // Check the command and its arguments for interpreters
                 // This handles cases like: | xargs bash -c, | env sh, etc.
-                check_command_for_interpreters(
-                    &cmd,
-                    has_pipe_to_shell,
-                    has_pipe_to_interpreter,
-                );
+                check_command_for_interpreters(&cmd, has_pipe_to_shell, has_pipe_to_interpreter);
+            }
+        }
+
+        // Find the first command (the pipe source). If it fetches remote content,
+        // piping into an interpreter is RCE; otherwise it's local data processing.
+        if let Some(first_cmd) = children.iter().find(|c| c.kind() == "command") {
+            if let Some(cmd) = extract_command(first_cmd, source) {
+                let name = cmd.name.to_lowercase();
+                let base = name.rsplit('/').next().unwrap_or(&name);
+                if REMOTE_FETCHERS.contains(base) {
+                    *pipe_source_is_remote = true;
+                }
             }
         }
     }
@@ -354,7 +424,13 @@ fn check_pipelines(
     // Recurse into children
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        check_pipelines(&child, source, has_pipe_to_shell, has_pipe_to_interpreter);
+        check_pipelines(
+            &child,
+            source,
+            has_pipe_to_shell,
+            has_pipe_to_interpreter,
+            pipe_source_is_remote,
+        );
     }
 }
 
@@ -398,14 +474,18 @@ fn check_command_for_interpreters(
                 return;
             }
             // Also check for path-based interpreter names
-            if arg_lower.ends_with("/sh") || arg_lower.ends_with("/bash")
-                || arg_lower.ends_with("/zsh") || arg_lower.ends_with("/dash")
+            if arg_lower.ends_with("/sh")
+                || arg_lower.ends_with("/bash")
+                || arg_lower.ends_with("/zsh")
+                || arg_lower.ends_with("/dash")
             {
                 *has_pipe_to_shell = true;
                 return;
             }
-            if arg_lower.ends_with("/python") || arg_lower.ends_with("/python3")
-                || arg_lower.ends_with("/ruby") || arg_lower.ends_with("/perl")
+            if arg_lower.ends_with("/python")
+                || arg_lower.ends_with("/python3")
+                || arg_lower.ends_with("/ruby")
+                || arg_lower.ends_with("/perl")
                 || arg_lower.ends_with("/node")
             {
                 *has_pipe_to_interpreter = true;
@@ -467,14 +547,20 @@ mod tests {
     fn test_command_substitution_dynamic() {
         let analysis = analyze_command("$(echo rm) -rf /");
         assert!(analysis.parsed);
-        assert!(analysis.has_dynamic_command, "Command substitution should be detected as dynamic");
+        assert!(
+            analysis.has_dynamic_command,
+            "Command substitution should be detected as dynamic"
+        );
     }
 
     #[test]
     fn test_variable_command_dynamic() {
         let analysis = analyze_command("$cmd arg1 arg2");
         assert!(analysis.parsed);
-        assert!(analysis.has_dynamic_command, "Variable command should be detected as dynamic");
+        assert!(
+            analysis.has_dynamic_command,
+            "Variable command should be detected as dynamic"
+        );
     }
 
     #[test]
@@ -495,7 +581,10 @@ mod tests {
     fn test_pipe_to_python() {
         let analysis = analyze_command("echo 'import os; os.system(\"id\")' | python3");
         assert!(analysis.parsed);
-        assert!(analysis.has_pipe_to_interpreter, "Should detect pipe to python");
+        assert!(
+            analysis.has_pipe_to_interpreter,
+            "Should detect pipe to python"
+        );
     }
 
     #[test]
@@ -503,7 +592,10 @@ mod tests {
         let analysis = analyze_command("echo test && rm -rf / || ls");
         assert!(analysis.parsed);
         // Should find multiple commands
-        assert!(analysis.commands.len() >= 2, "Should find multiple commands in compound");
+        assert!(
+            analysis.commands.len() >= 2,
+            "Should find multiple commands in compound"
+        );
     }
 
     #[test]
@@ -545,7 +637,10 @@ mod tests {
     fn test_backtick_substitution() {
         let analysis = analyze_command("`which rm` -rf /");
         assert!(analysis.parsed);
-        assert!(analysis.has_dynamic_command, "Backtick substitution should be dynamic");
+        assert!(
+            analysis.has_dynamic_command,
+            "Backtick substitution should be dynamic"
+        );
     }
 
     #[test]
@@ -553,7 +648,10 @@ mod tests {
         // Variable in argument position is fine
         let analysis = analyze_command("echo $HOME");
         assert!(analysis.parsed);
-        assert!(!analysis.has_dynamic_command, "Variable in argument is not dangerous");
+        assert!(
+            !analysis.has_dynamic_command,
+            "Variable in argument is not dangerous"
+        );
         assert!(has_command(&analysis, "echo"));
     }
 
@@ -571,27 +669,39 @@ mod tests {
         // Critical fix: xargs bash should be detected as pipe to shell
         let analysis = analyze_command("echo 'echo pwned' | xargs bash");
         assert!(analysis.parsed);
-        assert!(analysis.has_pipe_to_shell, "xargs bash should be detected as pipe to shell");
+        assert!(
+            analysis.has_pipe_to_shell,
+            "xargs bash should be detected as pipe to shell"
+        );
     }
 
     #[test]
     fn test_xargs_bash_c_pipe_detected() {
         let analysis = analyze_command("echo 'rm -rf /' | xargs bash -c");
         assert!(analysis.parsed);
-        assert!(analysis.has_pipe_to_shell, "xargs bash -c should be detected as pipe to shell");
+        assert!(
+            analysis.has_pipe_to_shell,
+            "xargs bash -c should be detected as pipe to shell"
+        );
     }
 
     #[test]
     fn test_sudo_bash_pipe_detected() {
         let analysis = analyze_command("cat script.sh | sudo bash");
         assert!(analysis.parsed);
-        assert!(analysis.has_pipe_to_shell, "sudo bash should be detected as pipe to shell");
+        assert!(
+            analysis.has_pipe_to_shell,
+            "sudo bash should be detected as pipe to shell"
+        );
     }
 
     #[test]
     fn test_xargs_python_pipe_detected() {
         let analysis = analyze_command("echo 'import os' | xargs python3 -c");
         assert!(analysis.parsed);
-        assert!(analysis.has_pipe_to_interpreter, "xargs python should be detected as pipe to interpreter");
+        assert!(
+            analysis.has_pipe_to_interpreter,
+            "xargs python should be detected as pipe to interpreter"
+        );
     }
 }
