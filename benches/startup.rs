@@ -2,8 +2,8 @@
 //!
 //! Run with: cargo bench
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use claude_guardrails::{Config, HookInput, SecurityEngine};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 /// Benchmark creating the security engine
 fn bench_engine_creation(c: &mut Criterion) {
@@ -20,9 +20,7 @@ fn bench_input_parsing(c: &mut Criterion) {
     let json = r#"{"tool_name":"Bash","tool_input":{"command":"ls -la"}}"#;
 
     c.bench_function("input_parsing", |b| {
-        b.iter(|| {
-            black_box(HookInput::from_json(black_box(json)).unwrap())
-        })
+        b.iter(|| black_box(HookInput::from_json(black_box(json)).unwrap()))
     });
 }
 
@@ -34,9 +32,7 @@ fn bench_safe_command(c: &mut Criterion) {
     let input = HookInput::from_json(json).unwrap();
 
     c.bench_function("check_safe_command", |b| {
-        b.iter(|| {
-            black_box(engine.check(black_box(&input)))
-        })
+        b.iter(|| black_box(engine.check(black_box(&input))))
     });
 }
 
@@ -48,9 +44,7 @@ fn bench_dangerous_command(c: &mut Criterion) {
     let input = HookInput::from_json(json).unwrap();
 
     c.bench_function("check_dangerous_command", |b| {
-        b.iter(|| {
-            black_box(engine.check(black_box(&input)))
-        })
+        b.iter(|| black_box(engine.check(black_box(&input))))
     });
 }
 
@@ -58,13 +52,12 @@ fn bench_dangerous_command(c: &mut Criterion) {
 fn bench_wrapped_command(c: &mut Criterion) {
     let config = Config::default();
     let engine = SecurityEngine::new(config);
-    let json = r#"{"tool_name":"Bash","tool_input":{"command":"sudo timeout 30 nice -n 10 rm -rf /"}}"#;
+    let json =
+        r#"{"tool_name":"Bash","tool_input":{"command":"sudo timeout 30 nice -n 10 rm -rf /"}}"#;
     let input = HookInput::from_json(json).unwrap();
 
     c.bench_function("check_wrapped_command", |b| {
-        b.iter(|| {
-            black_box(engine.check(black_box(&input)))
-        })
+        b.iter(|| black_box(engine.check(black_box(&input))))
     });
 }
 
@@ -76,9 +69,7 @@ fn bench_file_check(c: &mut Criterion) {
     let input = HookInput::from_json(json).unwrap();
 
     c.bench_function("check_file_path", |b| {
-        b.iter(|| {
-            black_box(engine.check(black_box(&input)))
-        })
+        b.iter(|| black_box(engine.check(black_box(&input))))
     });
 }
 
@@ -106,9 +97,7 @@ fn bench_compound_command(c: &mut Criterion) {
     let input = HookInput::from_json(json).unwrap();
 
     c.bench_function("check_compound_command", |b| {
-        b.iter(|| {
-            black_box(engine.check(black_box(&input)))
-        })
+        b.iter(|| black_box(engine.check(black_box(&input))))
     });
 }
 
