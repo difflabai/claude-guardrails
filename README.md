@@ -1,5 +1,8 @@
 # claude-guardrails
 
+[![CI](https://github.com/difflabai/claude-guardrails/actions/workflows/ci.yml/badge.svg)](https://github.com/difflabai/claude-guardrails/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 Security guardrails for Claude Code's YOLO mode (`--dangerously-skip-permissions`).
 
 A fast, robust pre-tool hook that analyzes commands before execution, blocking dangerous operations while allowing normal development workflows.
@@ -318,7 +321,13 @@ Then remove the hook entry from `~/.claude/settings.json`.
 | **How it works** | Pre-tool hook blocks dangerous commands | Populates `settings.json` permissions |
 | **Protects against** | Destructive commands, secrets exposure, exfiltration | Accidentally running unknown commands |
 
+## Contributing
+
+Issues and PRs welcome. The most useful contributions: new rules (with a test per rule), evasion techniques the engine misses, and false-positive reports that block legitimate workflows (include the command and your safety level). Run `cargo test` before submitting.
+
 ## Credits
+
+Built by [Differential AI Lab](https://difflab.ai). The v2 engine was validated against a 154,280-entry decision log from real-world agentic coding sessions.
 
 Inspired by:
 - [karanb192/claude-code-hooks](https://github.com/karanb192/claude-code-hooks) — Safety levels, multi-tool coverage
@@ -326,4 +335,4 @@ Inspired by:
 
 ## License
 
-MIT
+[MIT](LICENSE) © 2026 Differential AI Lab
