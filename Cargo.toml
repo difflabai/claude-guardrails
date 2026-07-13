@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "Security guardrails for Claude Code YOLO mode"
-repository = "https://github.com/leegonzales/claude-guardrails"
+repository = "https://github.com/difflabai/claude-guardrails"
 keywords = ["claude", "security", "guardrails", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 
