@@ -538,14 +538,22 @@ fn is_duration(s: &str) -> bool {
     !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
 }
 
-/// Every `command` node at or under `node`, including those in subshells,
-/// groups and command substitutions (a `$(bash)` argument inherits the
-/// pipeline's stdin too).
+/// Every `command` node at or under `node` that can read the stage's stdin:
+/// those in subshells, groups and command substitutions (a `$(bash)` argument
+/// inherits the pipeline's stdin too). In a nested pipeline only the first
+/// stage reads the outer stdin (`nc … | (printf x | python3)`: python3 reads
+/// printf); the nested pipeline gets its own check.
 fn collect_command_nodes<'a>(node: &Node<'a>, out: &mut Vec<Node<'a>>) {
     if node.kind() == "command" {
         out.push(*node);
     }
     let mut cursor = node.walk();
+    if node.kind() == "pipeline" {
+        if let Some(first) = node.named_children(&mut cursor).next() {
+            collect_command_nodes(&first, out);
+        }
+        return;
+    }
     for child in node.children(&mut cursor) {
         collect_command_nodes(&child, out);
     }
@@ -632,15 +640,18 @@ fn contains_kind(node: &Node, kinds: &[&str]) -> bool {
 
 /// Whether `node` is an interpreter command running an inline literal script:
 /// `python3 -c '<code>'`, `ruby -e`, `perl -ne`, `node -e`, `php -r`. Strict:
-/// - no env-assignment prefix (`PYTHONINSPECT=1` would read stdin as code);
+/// - an env-assignment prefix only for locale-style names (`LC_ALL=C`), never
+///   interpreter settings (`PYTHONINSPECT=1` reads stdin as code);
 /// - only known-harmless flags before the code flag (`python3 -i` would too);
-/// - every argument and redirect literal (no `$x`, `$(…)`, `<(…)`);
-/// - after the code, no further flags, except for Python (its `-c`
+/// - the code and every flag plain literals: no `$x`, `$(…)`, `<(…)`, `$'…'`
+///   or backslash escapes, which bash decodes after we look (`\--interactive`);
+/// - after the code, only plain non-flag words, except for Python (its `-c`
 ///   ends option parsing; later words are `sys.argv`);
-/// - the code holds no obvious code-execution primitive (`exec`, `eval`,
-///   `pickle`, …), so `exec(sys.stdin.read())` stays blocked.
+/// - the code holds no obvious code-execution, REPL or debugger primitive
+///   (`exec`, `pickle`, `breakpoint()`, `binding.irb`, Perl `s///ee`).
 fn is_inline_literal_script(node: &Node, source: &str, kind: Interp) -> bool {
-    let mut args = Vec::new();
+    // (normalized text, plain literal?) per argument, in order.
+    let mut args: Vec<(String, bool)> = Vec::new();
     let mut seen_name = false;
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -652,38 +663,109 @@ fn is_inline_literal_script(node: &Node, source: &str, kind: Interp) -> bool {
                 return false;
             }
         } else if !seen_name {
-            return false; // variable_assignment prefix
-        } else if child.is_named() {
-            let literal = matches!(
-                k,
-                "word" | "raw_string" | "string" | "concatenation" | "ansi_c_string" | "number"
-            ) && !contains_kind(&child, DYNAMIC_KINDS);
-            if !literal {
+            if !is_harmless_assignment(&child, source) {
                 return false;
             }
-            args.push(normalize_word(&child, source));
+        } else if child.is_named() {
+            args.push((
+                normalize_word(&child, source),
+                is_plain_literal(&child, source),
+            ));
         }
     }
 
-    let mut it = args.iter();
-    loop {
-        let Some(a) = it.next() else {
+    let mut i = 0;
+    let code = loop {
+        let Some((a, lit)) = args.get(i) else {
             return false; // no inline-code flag: a script file or stdin
         };
-        if is_code_flag(kind, a) {
-            break;
-        }
-        if !is_harmless_leading_flag(kind, a) {
+        if !lit {
             return false;
         }
-    }
-    let Some(code) = it.next() else {
-        return false;
+        if let Some(attached) = attached_code(kind, a) {
+            i += 1;
+            break attached;
+        }
+        if is_code_flag(kind, a) {
+            match args.get(i + 1) {
+                Some((c, true)) => {
+                    i += 2;
+                    break c.as_str();
+                }
+                _ => return false,
+            }
+        }
+        let Some(operands) = leading_flag_operands(kind, a) else {
+            return false;
+        };
+        for j in 1..=operands {
+            match args.get(i + j) {
+                Some((o, true)) if !o.starts_with('-') => {}
+                _ => return false,
+            }
+        }
+        i += 1 + operands;
     };
     if inline_code_executes_code(kind, code) {
         return false;
     }
-    kind == Interp::Python || it.all(|a| !a.starts_with('-'))
+    kind == Interp::Python || args[i..].iter().all(|(a, lit)| *lit && !a.starts_with('-'))
+}
+
+/// A literal whose shell value equals its normalized text: no expansions,
+/// no `$'…'`, and no backslash escapes in unquoted words.
+fn is_plain_literal(node: &Node, source: &str) -> bool {
+    fn has_escaped_word(n: &Node, source: &str) -> bool {
+        if n.kind() == "word"
+            && n.utf8_text(source.as_bytes())
+                .unwrap_or("\\")
+                .contains('\\')
+        {
+            return true;
+        }
+        let mut c = n.walk();
+        let found = n.children(&mut c).any(|ch| has_escaped_word(&ch, source));
+        found
+    }
+    matches!(
+        node.kind(),
+        "word" | "raw_string" | "string" | "concatenation" | "number"
+    ) && !contains_kind(node, DYNAMIC_KINDS)
+        && !contains_kind(node, &["ansi_c_string"])
+        && !has_escaped_word(node, source)
+}
+
+/// A `NAME=value` prefix that can't change how an interpreter reads stdin:
+/// locale and display settings with a plain literal value.
+fn is_harmless_assignment(node: &Node, source: &str) -> bool {
+    if node.kind() != "variable_assignment" {
+        return false;
+    }
+    let text = node.utf8_text(source.as_bytes()).unwrap_or("");
+    let name = text.split('=').next().unwrap_or("");
+    let safe_name = name.starts_with("LC_")
+        || matches!(
+            name,
+            "LANG" | "LANGUAGE" | "TZ" | "NO_COLOR" | "TERM" | "COLUMNS"
+        );
+    let mut c = node.walk();
+    let value_ok = node
+        .named_children(&mut c)
+        .skip(1)
+        .all(|v| is_plain_literal(&v, source));
+    safe_name && value_ok
+}
+
+/// The code of an attached form: `-c'print(1)'` (Python), `--eval=…` (Node).
+fn attached_code(kind: Interp, a: &str) -> Option<&str> {
+    let code = match kind {
+        Interp::Python => a.strip_prefix("-c"),
+        Interp::Node => a
+            .strip_prefix("--eval=")
+            .or_else(|| a.strip_prefix("--print=")),
+        _ => None,
+    }?;
+    (!code.is_empty()).then_some(code)
 }
 
 /// A short-flag cluster such as `-ne`: `-`, then letters from `allowed`, then
@@ -710,12 +792,19 @@ fn is_code_flag(kind: Interp, a: &str) -> bool {
     }
 }
 
-fn is_harmless_leading_flag(kind: Interp, a: &str) -> bool {
-    match kind {
-        Interp::Python => matches!(
-            a,
-            "-u" | "-B" | "-E" | "-s" | "-S" | "-I" | "-O" | "-OO" | "-q" | "-b" | "-bb" | "-P"
-        ),
+/// For a known-harmless flag before the code flag, how many operands it takes
+/// (`-W ignore` takes one). `None` for anything else.
+fn leading_flag_operands(kind: Interp, a: &str) -> Option<usize> {
+    let harmless = match kind {
+        Interp::Python => {
+            if matches!(a, "-W" | "-X") {
+                return Some(1);
+            }
+            matches!(
+                a,
+                "-u" | "-B" | "-E" | "-s" | "-S" | "-I" | "-O" | "-OO" | "-q" | "-b" | "-bb" | "-P"
+            )
+        }
         Interp::Ruby => is_flag_cluster(a, "nplaw", &['n', 'p', 'l', 'a', 'w']),
         Interp::Perl => is_flag_cluster(a, "lnpaw", &['l', 'n', 'p', 'a', 'w']),
         Interp::Node => matches!(
@@ -724,34 +813,55 @@ fn is_harmless_leading_flag(kind: Interp, a: &str) -> bool {
         ),
         Interp::Php => a == "-n",
         Interp::Shell => false,
-    }
+    };
+    harmless.then_some(0)
 }
 
-/// Code-execution primitives that would turn fetched stdin back into code.
-/// Not exhaustive: a determined literal can still exec its input. It keeps
-/// the obvious forms (`exec(sys.stdin.read())`, `pickle.loads`, `eval <STDIN>`)
-/// blocked under the RCE rule even when the content packs are disabled.
+/// Primitives that would turn fetched stdin back into code: code execution,
+/// deserializers that run code, and REPLs/debuggers that read program text
+/// from stdin. Not exhaustive: a determined literal can still run its input.
+/// It keeps the obvious forms (`exec(sys.stdin.read())`, `pickle.loads`,
+/// `breakpoint()`, `eval <STDIN>`, `s/.*/$&/ee`) blocked under the RCE rule
+/// even when the content packs are disabled. Word-bounded, so ordinary
+/// strings (`"executive"`) and static imports (`require "json"`) pass.
 fn inline_code_executes_code(kind: Interp, code: &str) -> bool {
     static COMMON: Lazy<regex::Regex> = Lazy::new(|| {
-        regex::Regex::new(
-            r"exec|eval|system|popen|spawn|subprocess|child_process|pickle|marshal|shelve|dill|joblib|runpy|interact|yaml\.(unsafe_)?load|`",
-        )
+        regex::Regex::new(concat!(
+            r"(?:\b|_)(exec|eval)\b",
+            r"|\b(exec|spawn)(v|l|vp|lp|ve|le|vpe|lpe|Sync|File|FileSync)\b",
+            r"|\b(system|popen|subprocess|child_process|pickle|marshal|shelve|dill|joblib",
+            r"|runpy|interact|InteractiveConsole|InteractiveInterpreter|breakpoint|pdb",
+            r"|set_trace|debugger|repl|inspector|irb|pry|binding)\b",
+            r"|yaml\.(unsafe_)?load\b",
+        ))
         .unwrap()
     });
-    static RUBY_PERL: Lazy<regex::Regex> = Lazy::new(|| {
-        regex::Regex::new(r"\bopen\b|\bload\b|\brequire\b|\bdo\b|\bqx\b|%x|\bsyscall\b").unwrap()
+    static RUBY: Lazy<regex::Regex> = Lazy::new(|| {
+        regex::Regex::new(r"\bopen\b|%x|`|\bsyscall\b|\b(send|__send__|public_send|fork)\b")
+            .unwrap()
     });
-    static NODE: Lazy<regex::Regex> =
-        Lazy::new(|| regex::Regex::new(r"\bFunction\b|\bvm\b|\bimport\s*\(|\brequire\b").unwrap());
+    // `s///ee` evaluates the replacement's result: a delimiter, then a
+    // modifier run with two `e`s.
+    static PERL: Lazy<regex::Regex> = Lazy::new(|| {
+        regex::Regex::new(concat!(
+            r"\bopen\b|\bqx\b|`|\bsyscall\b|\bdo\s*[$'\x22<]|\brequire\s*\$",
+            r"|[/#|!}\])>][msixpodualngcer]*e[msixpodualngcer]*e[msixpodualngcer]*\b",
+        ))
+        .unwrap()
+    });
+    static NODE: Lazy<regex::Regex> = Lazy::new(|| {
+        regex::Regex::new(r"\bFunction\b|\bvm\b|\bimport\s*\(|\bWorker\b|_compile\b").unwrap()
+    });
     static PHP: Lazy<regex::Regex> = Lazy::new(|| {
         regex::Regex::new(
-            r"passthru|proc_open|\binclude|\brequire|\bassert\b|create_function|preg_replace",
+            r"passthru|proc_open|shell_exec|\binclude|\brequire|\bassert\b|create_function|preg_replace|`",
         )
         .unwrap()
     });
     COMMON.is_match(code)
         || match kind {
-            Interp::Ruby | Interp::Perl => RUBY_PERL.is_match(code),
+            Interp::Ruby => RUBY.is_match(code),
+            Interp::Perl => PERL.is_match(code),
             Interp::Node => NODE.is_match(code),
             Interp::Php => PHP.is_match(code),
             Interp::Python | Interp::Shell => false,
