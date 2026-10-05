@@ -159,7 +159,10 @@ wrappers = ["sudo", "timeout", "xargs", "env", "nice", "nohup", "ionice", "strac
 # Block $cmd, $(cmd), `cmd` at command start
 block_variable_commands = true
 
-# Block | sh, | bash, | python
+# Block piping to a shell (any source), and remote content (fetchers such as
+# curl, wget, nc) into an interpreter at any later stage. An interpreter
+# running an inline literal script (python3 -c '...', ruby -e, perl -ne,
+# node -e, php -r) reads the fetched bytes as data and is allowed.
 block_pipe_to_shell = true
 
 [files]

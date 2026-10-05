@@ -5,6 +5,7 @@
 
 use once_cell::sync::Lazy;
 use std::collections::HashSet;
+use std::ops::Range;
 use tree_sitter::{Node, Parser, Tree};
 
 /// Shell interpreters that are dangerous when used as pipe targets
@@ -95,12 +96,19 @@ pub struct CommandAnalysis {
     pub has_pipe_to_interpreter: bool,
     /// Whether ANY pipeline is sourced from remote content (informational).
     pub pipe_source_is_remote: bool,
-    /// Whether a SINGLE pipeline both is sourced from remote content AND feeds an
-    /// interpreter (`curl … | python3`) — i.e. remote code execution. Computed
-    /// per-pipeline (with wrapper unwrapping on the source) so a benign remote pipe
-    /// in one compound segment and a local data→interpreter pipe in another don't
-    /// combine into a false deny. This is the flag the RCE rule keys on.
+    /// Whether a SINGLE pipeline has a remote fetcher in some stage AND a later
+    /// stage that runs its stdin as code (`curl … | python3`, `nc … | bash | cat`)
+    /// — i.e. remote code execution. Computed per-pipeline (with wrapper
+    /// unwrapping) so a benign remote pipe in one compound segment and a local
+    /// data→interpreter pipe in another don't combine into a false deny. An
+    /// interpreter running an inline literal script (`python3 -c '…'`) reads the
+    /// fetched bytes as data, not code, and does not set it (uun). This is the
+    /// flag the RCE rule keys on.
     pub has_remote_source_to_interpreter: bool,
+    /// Byte ranges of pipeline stages (after the first) verified to be an
+    /// interpreter running an inline literal script. The text backstop rule
+    /// `curl-pipe-python` is evaluated with these masked out.
+    pub inline_script_ranges: Vec<Range<usize>>,
     /// Raw AST parse succeeded
     pub parsed: bool,
     /// Error message if parsing failed
@@ -136,6 +144,7 @@ pub fn analyze_command(source: &str) -> CommandAnalysis {
             has_pipe_to_interpreter: false,
             pipe_source_is_remote: false,
             has_remote_source_to_interpreter: false,
+            inline_script_ranges: vec![],
             parsed: false,
             error: Some("Failed to load tree-sitter-bash language".to_string()),
         };
@@ -151,6 +160,7 @@ pub fn analyze_command(source: &str) -> CommandAnalysis {
                 has_pipe_to_interpreter: false,
                 pipe_source_is_remote: false,
                 has_remote_source_to_interpreter: false,
+                inline_script_ranges: vec![],
                 parsed: false,
                 error: Some("Failed to parse command".to_string()),
             };
@@ -175,6 +185,7 @@ fn analyze_tree(tree: &Tree, source: &str) -> CommandAnalysis {
             has_pipe_to_interpreter: false,
             pipe_source_is_remote: false,
             has_remote_source_to_interpreter: false,
+            inline_script_ranges: vec![],
             parsed: false,
             error: Some("AST contains parse errors - using fallback".to_string()),
         };
@@ -197,6 +208,7 @@ fn analyze_tree(tree: &Tree, source: &str) -> CommandAnalysis {
         has_pipe_to_interpreter: flags.pipe_to_interpreter,
         pipe_source_is_remote: flags.source_is_remote,
         has_remote_source_to_interpreter: flags.remote_source_to_interpreter,
+        inline_script_ranges: flags.inline_script_ranges,
         parsed: true,
         error: None,
     }
@@ -213,6 +225,8 @@ struct PipeFlags {
     source_is_remote: bool,
     /// Some SINGLE pipeline is remote-sourced AND interpreter-sunk (RCE).
     remote_source_to_interpreter: bool,
+    /// Stages verified as inline literal scripts (see CommandAnalysis).
+    inline_script_ranges: Vec<Range<usize>>,
 }
 
 /// Recursively collect all commands from the AST
@@ -435,8 +449,46 @@ fn check_pipelines(node: &Node, source: &str, flags: &mut PipeFlags) {
         flags.pipe_to_shell |= sink_shell;
         flags.pipe_to_interpreter |= sink_interp;
         flags.source_is_remote |= src_remote;
-        // The RCE conjunction, scoped to THIS pipeline.
-        flags.remote_source_to_interpreter |= src_remote && sink_interp;
+
+        // The RCE conjunction, scoped to THIS pipeline: a stage that runs its
+        // stdin as code, downstream of any stage that fetches remote content.
+        // Every stage counts, not just the last (`nc … | bash | cat`), and every
+        // command inside a stage (`… | (python3)`, `… | cat "$(bash)"`).
+        let stages: Vec<_> = {
+            let mut c = node.walk();
+            node.named_children(&mut c).collect()
+        };
+        // tree-sitter hangs a trailing redirect (`a | b < <(c)`) on a
+        // redirected_statement around the whole pipeline; bash applies it to
+        // the last stage, so its commands join that stage.
+        let mut trailing = Vec::new();
+        if let Some(parent) = node.parent() {
+            if parent.kind() == "redirected_statement" {
+                let mut c = parent.walk();
+                for r in parent.named_children(&mut c) {
+                    if r.kind().ends_with("_redirect") {
+                        collect_command_nodes(&r, &mut trailing);
+                    }
+                }
+            }
+        }
+        let mut upstream_remote = false;
+        for (i, stage) in stages.iter().enumerate() {
+            let mut cmds = Vec::new();
+            collect_command_nodes(stage, &mut cmds);
+            if i + 1 == stages.len() {
+                cmds.extend(trailing.iter().copied());
+            }
+            if i > 0 {
+                for c in &cmds {
+                    let runs = runs_stdin_as_code(c, source, &mut flags.inline_script_ranges);
+                    flags.remote_source_to_interpreter |= upstream_remote && runs;
+                }
+            }
+            upstream_remote |= cmds.iter().any(|c| {
+                extract_command(c, source).is_some_and(|nc| command_is_remote_fetcher(&nc))
+            });
+        }
     }
 
     // Recurse into children
@@ -484,6 +536,246 @@ fn command_is_remote_fetcher(cmd: &NormalizedCommand) -> bool {
 fn is_duration(s: &str) -> bool {
     let digits = s.trim_end_matches(['s', 'm', 'h', 'd']);
     !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Every `command` node at or under `node`, including those in subshells,
+/// groups and command substitutions (a `$(bash)` argument inherits the
+/// pipeline's stdin too).
+fn collect_command_nodes<'a>(node: &Node<'a>, out: &mut Vec<Node<'a>>) {
+    if node.kind() == "command" {
+        out.push(*node);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_command_nodes(&child, out);
+    }
+}
+
+/// Interpreter families, for the inline-literal-script exemption.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Interp {
+    Shell,
+    Python,
+    Ruby,
+    Perl,
+    Node,
+    Php,
+}
+
+/// Classify a command name as an interpreter, by full name or basename, with
+/// version suffixes stripped (`python3.12`, `/opt/homebrew/bin/python3`).
+fn interpreter_kind(name: &str) -> Option<Interp> {
+    let lower = name.to_lowercase();
+    let base = lower.rsplit('/').next().unwrap_or("");
+    if SHELL_INTERPRETERS.contains(lower.as_str()) || SHELL_INTERPRETERS.contains(base) {
+        return Some(Interp::Shell);
+    }
+    let stem = base.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    match stem {
+        "python" | "pypy" => Some(Interp::Python),
+        "ruby" => Some(Interp::Ruby),
+        "perl" => Some(Interp::Perl),
+        "node" | "nodejs" => Some(Interp::Node),
+        "php" => Some(Interp::Php),
+        _ => None,
+    }
+}
+
+/// Whether a pipeline-stage command runs its stdin as code: a shell, a bare
+/// interpreter (`python3`, `python3 -`, `python3 script.py`), or an
+/// interpreter behind a wrapper (`xargs python3 -c`, `env python3 …`). An
+/// interpreter invoked directly with an inline literal script reads stdin as
+/// data; its range is recorded in `inline_ranges` and it does not count.
+fn runs_stdin_as_code(node: &Node, source: &str, inline_ranges: &mut Vec<Range<usize>>) -> bool {
+    let Some(cmd) = extract_command(node, source) else {
+        return false;
+    };
+    match interpreter_kind(&cmd.name) {
+        Some(Interp::Shell) => true,
+        Some(kind) => {
+            if is_inline_literal_script(node, source, kind) {
+                inline_ranges.push(node.byte_range());
+                false
+            } else {
+                true
+            }
+        }
+        None => {
+            let lower = cmd.name.to_lowercase();
+            let base = lower.rsplit('/').next().unwrap_or("");
+            PIPELINE_WRAPPERS.contains(base)
+                && cmd
+                    .arguments
+                    .iter()
+                    .any(|a| !a.starts_with('-') && interpreter_kind(a).is_some())
+        }
+    }
+}
+
+/// Node kinds whose text is not fixed at parse time.
+const DYNAMIC_KINDS: &[&str] = &[
+    "simple_expansion",
+    "expansion",
+    "command_substitution",
+    "process_substitution",
+    "arithmetic_expansion",
+];
+
+fn contains_kind(node: &Node, kinds: &[&str]) -> bool {
+    if kinds.contains(&node.kind()) {
+        return true;
+    }
+    let mut cursor = node.walk();
+    let found = node.children(&mut cursor).any(|c| contains_kind(&c, kinds));
+    found
+}
+
+/// Whether `node` is an interpreter command running an inline literal script:
+/// `python3 -c '<code>'`, `ruby -e`, `perl -ne`, `node -e`, `php -r`. Strict:
+/// - no env-assignment prefix (`PYTHONINSPECT=1` would read stdin as code);
+/// - only known-harmless flags before the code flag (`python3 -i` would too);
+/// - every argument and redirect literal (no `$x`, `$(…)`, `<(…)`);
+/// - after the code, no further flags, except for Python (its `-c`
+///   ends option parsing; later words are `sys.argv`);
+/// - the code holds no obvious code-execution primitive (`exec`, `eval`,
+///   `pickle`, …), so `exec(sys.stdin.read())` stays blocked.
+fn is_inline_literal_script(node: &Node, source: &str, kind: Interp) -> bool {
+    let mut args = Vec::new();
+    let mut seen_name = false;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        let k = child.kind();
+        if k == "command_name" {
+            seen_name = true;
+        } else if k.ends_with("_redirect") {
+            if contains_kind(&child, DYNAMIC_KINDS) {
+                return false;
+            }
+        } else if !seen_name {
+            return false; // variable_assignment prefix
+        } else if child.is_named() {
+            let literal = matches!(
+                k,
+                "word" | "raw_string" | "string" | "concatenation" | "ansi_c_string" | "number"
+            ) && !contains_kind(&child, DYNAMIC_KINDS);
+            if !literal {
+                return false;
+            }
+            args.push(normalize_word(&child, source));
+        }
+    }
+
+    let mut it = args.iter();
+    loop {
+        let Some(a) = it.next() else {
+            return false; // no inline-code flag: a script file or stdin
+        };
+        if is_code_flag(kind, a) {
+            break;
+        }
+        if !is_harmless_leading_flag(kind, a) {
+            return false;
+        }
+    }
+    let Some(code) = it.next() else {
+        return false;
+    };
+    if inline_code_executes_code(kind, code) {
+        return false;
+    }
+    kind == Interp::Python || it.all(|a| !a.starts_with('-'))
+}
+
+/// A short-flag cluster such as `-ne`: `-`, then letters from `allowed`, then
+/// one of `last`.
+fn is_flag_cluster(a: &str, allowed: &str, last: &[char]) -> bool {
+    let Some(body) = a.strip_prefix('-') else {
+        return false;
+    };
+    let mut chars: Vec<char> = body.chars().collect();
+    match chars.pop() {
+        Some(c) if last.contains(&c) => chars.iter().all(|c| allowed.contains(*c)),
+        _ => false,
+    }
+}
+
+fn is_code_flag(kind: Interp, a: &str) -> bool {
+    match kind {
+        Interp::Python => a == "-c",
+        Interp::Ruby => is_flag_cluster(a, "nplaw", &['e']),
+        Interp::Perl => is_flag_cluster(a, "lnpaw", &['e', 'E']),
+        Interp::Node => matches!(a, "-e" | "--eval" | "-p" | "--print"),
+        Interp::Php => a == "-r",
+        Interp::Shell => false,
+    }
+}
+
+fn is_harmless_leading_flag(kind: Interp, a: &str) -> bool {
+    match kind {
+        Interp::Python => matches!(
+            a,
+            "-u" | "-B" | "-E" | "-s" | "-S" | "-I" | "-O" | "-OO" | "-q" | "-b" | "-bb" | "-P"
+        ),
+        Interp::Ruby => is_flag_cluster(a, "nplaw", &['n', 'p', 'l', 'a', 'w']),
+        Interp::Perl => is_flag_cluster(a, "lnpaw", &['l', 'n', 'p', 'a', 'w']),
+        Interp::Node => matches!(
+            a,
+            "--no-warnings" | "--input-type=module" | "--input-type=commonjs"
+        ),
+        Interp::Php => a == "-n",
+        Interp::Shell => false,
+    }
+}
+
+/// Code-execution primitives that would turn fetched stdin back into code.
+/// Not exhaustive: a determined literal can still exec its input. It keeps
+/// the obvious forms (`exec(sys.stdin.read())`, `pickle.loads`, `eval <STDIN>`)
+/// blocked under the RCE rule even when the content packs are disabled.
+fn inline_code_executes_code(kind: Interp, code: &str) -> bool {
+    static COMMON: Lazy<regex::Regex> = Lazy::new(|| {
+        regex::Regex::new(
+            r"exec|eval|system|popen|spawn|subprocess|child_process|pickle|marshal|shelve|dill|joblib|runpy|interact|yaml\.(unsafe_)?load|`",
+        )
+        .unwrap()
+    });
+    static RUBY_PERL: Lazy<regex::Regex> = Lazy::new(|| {
+        regex::Regex::new(r"\bopen\b|\bload\b|\brequire\b|\bdo\b|\bqx\b|%x|\bsyscall\b").unwrap()
+    });
+    static NODE: Lazy<regex::Regex> =
+        Lazy::new(|| regex::Regex::new(r"\bFunction\b|\bvm\b|\bimport\s*\(|\brequire\b").unwrap());
+    static PHP: Lazy<regex::Regex> = Lazy::new(|| {
+        regex::Regex::new(
+            r"passthru|proc_open|\binclude|\brequire|\bassert\b|create_function|preg_replace",
+        )
+        .unwrap()
+    });
+    COMMON.is_match(code)
+        || match kind {
+            Interp::Ruby | Interp::Perl => RUBY_PERL.is_match(code),
+            Interp::Node => NODE.is_match(code),
+            Interp::Php => PHP.is_match(code),
+            Interp::Python | Interp::Shell => false,
+        }
+}
+
+/// `command` with each range replaced by a neutral token, for running text
+/// rules on the parts the AST did not clear. Ranges come from tree-sitter, so
+/// they sit on char boundaries; overlapping or duplicate ranges are skipped.
+pub fn mask_ranges(command: &str, ranges: &[Range<usize>]) -> String {
+    let mut sorted: Vec<_> = ranges.to_vec();
+    sorted.sort_by_key(|r| (r.start, r.end));
+    let mut out = String::with_capacity(command.len());
+    let mut pos = 0;
+    for r in sorted {
+        if r.start < pos || r.end > command.len() {
+            continue;
+        }
+        out.push_str(&command[pos..r.start]);
+        out.push_str("inline-literal-script");
+        pos = r.end;
+    }
+    out.push_str(&command[pos..]);
+    out
 }
 
 /// Check a command (and its arguments) for shell/script interpreters
