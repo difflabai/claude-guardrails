@@ -199,12 +199,11 @@ Existing Python interpreter paths remain supported.
 | `curl` | **Requires standalone `-q` as the first argument**; then `-s -S -f -L -4 -6 --compressed`; `-H HEADER -A AGENT -m SECONDS --max-time SECONDS --connect-timeout SECONDS --retry N`; HTTP(S) URL operands |
 | `cat` | No flags or operands; reads stdin |
 | `head`, `tail` | `-n N`; reads stdin |
-| `grep` | `-E -F -i -v -o -m N` and exactly one literal pattern |
+| `grep` | `-E -F -i -v -o -m N` and exactly one nonempty literal pattern |
 | `cut` | `-d DELIMITER -f FIELDS`; reads stdin |
 | `tr` | No flags; exactly two literal set operands |
 | `uniq` | `-c`; reads stdin |
 | `wc` | `-l -c -w`; reads stdin |
-| `nc` | No flags; exactly a host and a numeric port (1–65535) |
 | `echo` | No flags; literal words that do not start with `-` |
 
 For these data stages, short flags without operands can be combined (such as
@@ -215,7 +214,8 @@ attached values, long-option abbreviations, `--flag=value`, and `--` are exclude
 Counts are nonnegative decimal
 integers; timeouts are finite nonnegative numbers. Header, agent, delimiter and
 field operands must be nonempty and cannot start with `-` or `@`. Filters accept
-no file operands. Wget is excluded entirely because startup configs and HSTS
+no file operands. Nc is excluded because it can forward fetched bytes to local
+services, including commands that mutate service state. Wget is excluded entirely because startup configs and HSTS
 state can cause writes even with stdout downloads. Sort is excluded because
 large inputs can spill to temporary files. Jq is excluded because it
 [automatically sources `~/.jq` when it is a file](https://jqlang.org/manual/#modules).
@@ -235,16 +235,26 @@ as defence in depth.
 Modules already in the working directory (such as a planted `json.py`) and the
 environment inherited from **outside the command** (such as `PYTHONWARNINGS` or
 `PYTHONSTARTUP` set in the user's shell profile) are not visible to this hook;
-the allowlist cannot defend against them.
+the allowlist cannot defend against them. Python startup hooks outside the working
+directory are also trusted: user-site `.pth` import lines, `sitecustomize`,
+`usercustomize`, and virtual-environment startup hooks can execute code before
+`-c`, including code that reads stdin. Ordinary imports can write `.pyc` files.
+Executable lookup and shell function resolution must be trusted; this hook does
+not verify that an allowed command name resolves to the intended executable.
 Environment inherited from outside the command, such as `SSLKEYLOGFILE`, can make
-curl append to a file even with `-q`; this is a side effect with no known path to
-code execution in the Python stage.
+curl append TLS secrets to a file even with `-q`, exposing secrets that permit
+decryption of captured traffic.
 
 Double-quoted shell words are decoded using bash's backslash rules before the
 Python allowlist runs. CR, NUL and form feed are rejected anywhere in the code;
 tabs remain supported. Uncertain shell word kinds get no exemption.
 
-Before `-c`, Python `-W` accepts only the bare actions `ignore`, `default`,
+Accepted interpreter spellings include `python`, `pypy`, version suffixes (such
+as `python3.12` and `pypy3`), and paths to these names. Before `-c`, the accepted
+leading flags are `-u -B -E -s -S -I -O -OO -q -b -bb -P`, plus the restricted
+`-W` and `-X` forms below.
+
+Python `-W` accepts only the bare actions `ignore`, `default`,
 `error`, `always`, `module` and `once`, with no colon fields. `-X` accepts only
 `utf8`, `utf8=0` and `utf8=1`. These restrictions apply to both separate and
 attached operands; all other `-W`/`-X` settings get no exemption.
@@ -268,7 +278,7 @@ The exact Python name allowlist is:
 | re members | `findall, match, search, sub, split, compile` |
 | csv members | `reader, DictReader, writer` |
 | collections members | `Counter, defaultdict, OrderedDict` |
-| itertools members | `accumulate, chain, combinations, combinations_with_replacement, compress, count, cycle, dropwhile, filterfalse, groupby, islice, pairwise, permutations, product, repeat, starmap, takewhile, tee, zip_longest` |
+| itertools members | `accumulate, chain, combinations, combinations_with_replacement, compress, dropwhile, filterfalse, groupby, islice, pairwise, permutations, product, starmap, takewhile, tee, zip_longest` |
 | math members | `acos, acosh, asin, asinh, atan, atan2, atanh, ceil, comb, copysign, cos, cosh, degrees, dist, erf, erfc, exp, exp2, expm1, fabs, factorial, floor, fmod, frexp, fsum, gamma, gcd, hypot, isclose, isfinite, isinf, isnan, isqrt, lcm, ldexp, lgamma, log, log10, log1p, log2, modf, nextafter, perm, pow, prod, radians, remainder, sin, sinh, sqrt, tan, tanh, trunc, ulp, e, inf, nan, pi, tau` |
 
 Imports may use only `json`, `sys`, `re`, `csv`, `collections`, `itertools`, or
@@ -296,7 +306,19 @@ semicolon-separated simple statements, conditional expressions, simple one-line
 allowlisted bodies. Walrus targets must be fixed local names. It rejects
 `def`, `class`, indented suites, aliases, unpacking, decorators, backticks,
 backslash continuations outside strings, non-ASCII identifiers and dunder names.
-Nesting is limited to 64 levels and scripts to 4096 tokens.
+Python nesting is limited to 64 levels and scripts to 4096 tokens. Shell ASTs
+are analysed on a joined worker thread with a 256 MiB stack and limited to depth
+6,000 and 131,072 nodes. The depth limit budgets 8 KiB per level (over five times
+the largest measured recursive debug frame), leaving over 5× stack margin. A
+command at the node cap took 0.53 s in a local debug build, below the ~2 s analysis
+budget. Exceeding either limit, worker creation failure, or a worker panic is
+explicitly denied as too complex to analyse, without an exemption or regex fallback.
+
+These analysis bounds do not limit runtime memory or CPU. Large JSON inputs,
+large containers, combinatorial operations, and infinite iterators can exhaust
+resources; input-size and execution limits remain the caller's responsibility.
+`itertools.count`, `itertools.cycle`, and `itertools.repeat` are excluded, while
+the finite-input itertools members listed above remain supported.
 
 Strings and comments are data, not names to scan. Plain strings and case-insensitive
 `r`, `b`, `br`, `rb` prefixes are supported; f-strings, template strings, `u` prefixes,

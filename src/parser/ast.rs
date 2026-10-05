@@ -63,26 +63,6 @@ static REMOTE_FETCHERS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
     .collect()
 });
 
-/// Script interpreters (also dangerous as pipe targets)
-static SCRIPT_INTERPRETERS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
-    [
-        "python",
-        "python2",
-        "python3",
-        "ruby",
-        "perl",
-        "node",
-        "php",
-        "/usr/bin/python",
-        "/usr/bin/python3",
-        "/usr/bin/ruby",
-        "/usr/bin/perl",
-        "/usr/bin/node",
-    ]
-    .into_iter()
-    .collect()
-});
-
 /// Result of AST-based command analysis
 #[derive(Debug, Clone)]
 pub struct CommandAnalysis {
@@ -109,6 +89,8 @@ pub struct CommandAnalysis {
     /// Python interpreter running allowlisted literal code. The text backstop rule
     /// `curl-pipe-python` is evaluated with these masked out.
     pub inline_script_ranges: Vec<Range<usize>>,
+    /// AST limits or worker failure refused analysis; enforcement must deny, not fall back.
+    pub too_complex: bool,
     /// Raw AST parse succeeded
     pub parsed: bool,
     /// Error message if parsing failed
@@ -130,6 +112,43 @@ pub struct NormalizedCommand {
 
 /// Parse and analyze a bash command using tree-sitter
 pub fn analyze_command(source: &str) -> CommandAnalysis {
+    on_analysis_stack(|| parse_and_analyze_command(source))
+}
+
+/// Keep recursive Rust and tree-sitter work off the caller's small stack.
+/// Joining explicitly prevents a worker panic from becoming a regex fallback.
+fn on_analysis_stack<F>(analyze: F) -> CommandAnalysis
+where
+    F: FnOnce() -> CommandAnalysis + Send,
+{
+    std::thread::scope(|scope| {
+        match std::thread::Builder::new()
+            .name("shell-ast-analysis".into())
+            .stack_size(AST_STACK_SIZE)
+            .spawn_scoped(scope, analyze)
+        {
+            Ok(worker) => worker.join().unwrap_or_else(|_| too_complex_analysis()),
+            Err(_) => too_complex_analysis(),
+        }
+    })
+}
+
+fn too_complex_analysis() -> CommandAnalysis {
+    CommandAnalysis {
+        commands: vec![],
+        has_dynamic_command: false,
+        has_pipe_to_shell: false,
+        has_pipe_to_interpreter: false,
+        pipe_source_is_remote: false,
+        has_remote_source_to_interpreter: false,
+        inline_script_ranges: vec![],
+        too_complex: true,
+        parsed: false,
+        error: Some("Command is too complex to analyse (AST depth or node limit exceeded)".into()),
+    }
+}
+
+fn parse_and_analyze_command(source: &str) -> CommandAnalysis {
     let mut parser = Parser::new();
 
     // Set the bash language
@@ -145,6 +164,7 @@ pub fn analyze_command(source: &str) -> CommandAnalysis {
             pipe_source_is_remote: false,
             has_remote_source_to_interpreter: false,
             inline_script_ranges: vec![],
+            too_complex: false,
             parsed: false,
             error: Some("Failed to load tree-sitter-bash language".to_string()),
         };
@@ -161,6 +181,7 @@ pub fn analyze_command(source: &str) -> CommandAnalysis {
                 pipe_source_is_remote: false,
                 has_remote_source_to_interpreter: false,
                 inline_script_ranges: vec![],
+                too_complex: false,
                 parsed: false,
                 error: Some("Failed to parse command".to_string()),
             };
@@ -174,6 +195,10 @@ pub fn analyze_command(source: &str) -> CommandAnalysis {
 fn analyze_tree(tree: &Tree, source: &str) -> CommandAnalysis {
     let root = tree.root_node();
 
+    if !ast_is_bounded(&root) {
+        return too_complex_analysis();
+    }
+
     // CRITICAL FIX: Check if the tree has parse errors
     // tree-sitter can return a partial tree with errors, which might miss dangerous patterns
     // If there are errors, mark as not parsed to trigger fallback regex checks
@@ -186,6 +211,7 @@ fn analyze_tree(tree: &Tree, source: &str) -> CommandAnalysis {
             pipe_source_is_remote: false,
             has_remote_source_to_interpreter: false,
             inline_script_ranges: vec![],
+            too_complex: false,
             parsed: false,
             error: Some("AST contains parse errors - using fallback".to_string()),
         };
@@ -193,7 +219,10 @@ fn analyze_tree(tree: &Tree, source: &str) -> CommandAnalysis {
 
     let mut commands = Vec::new();
     let mut has_dynamic_command = false;
-    let mut flags = PipeFlags::default();
+    let mut flags = PipeFlags {
+        inline_candidate: single_interpreter_candidate(&root, source),
+        ..PipeFlags::default()
+    };
 
     // Traverse all nodes looking for commands and pipelines
     collect_commands(&root, source, &mut commands, &mut has_dynamic_command);
@@ -209,14 +238,82 @@ fn analyze_tree(tree: &Tree, source: &str) -> CommandAnalysis {
         pipe_source_is_remote: flags.source_is_remote,
         has_remote_source_to_interpreter: flags.remote_source_to_interpreter,
         inline_script_ranges: flags.inline_script_ranges,
+        too_complex: false,
         parsed: true,
         error: None,
+    }
+}
+
+// Check before any recursive Rust traversal, including normalization and policy.
+// A cursor keeps both time and auxiliary memory bounded without using the stack.
+// arm64 debug disassembly: collect_commands = 576 B/level,
+// check_pipeline_flow = 1600 B/level, normalize_concatenation = 672 B/level.
+// Budget 8 KiB/level for helper/iterator frames and compiler variation:
+// 6000 * 8 KiB = 46.875 MiB, leaving >5x margin on the 256 MiB worker stack.
+const AST_STACK_SIZE: usize = 256 * 1024 * 1024;
+pub(crate) const MAX_AST_DEPTH: usize = 6_000;
+// A flat `git add` at exactly 131,072 nodes took 0.53 s end-to-end in debug
+// on the development machine, below the ~2 s budget. 40,000 paths use 40,005 nodes.
+pub(crate) const MAX_AST_NODES: usize = 131_072;
+
+fn ast_is_bounded(root: &Node) -> bool {
+    let mut cursor = root.walk();
+    let mut depth = 0;
+    let mut nodes = 0;
+    loop {
+        nodes += 1;
+        if depth > MAX_AST_DEPTH || nodes > MAX_AST_NODES {
+            return false;
+        }
+        if cursor.goto_first_child() {
+            depth += 1;
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return true;
+            }
+            depth -= 1;
+        }
+    }
+}
+
+/// Whole-pipeline validation is eligible only for one interpreter. Stop at the
+/// second rather than revalidating the program for each Python stage.
+fn single_interpreter_candidate(root: &Node, source: &str) -> Option<usize> {
+    let mut cursor = root.walk();
+    let mut candidate = None;
+    loop {
+        let node = cursor.node();
+        if node.kind() == "command" {
+            if let Some(name) = node.child_by_field_name("name") {
+                let (name, _) = normalize_command_name(&name, source);
+                if interpreter_kind(&name).is_some() && candidate.replace(node.id()).is_some() {
+                    return None;
+                }
+            }
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return candidate;
+            }
+        }
     }
 }
 
 /// Accumulated pipeline classification across all pipeline nodes in a command.
 #[derive(Default)]
 struct PipeFlags {
+    inline_candidate: Option<usize>,
     /// Any pipeline sinks into a shell interpreter (broad, always dangerous).
     pipe_to_shell: bool,
     /// Any pipeline sinks into a script interpreter (informational).
@@ -465,19 +562,25 @@ fn check_pipeline_flow(
     let mut output_remote = false;
     if node.kind() == "command" {
         if let Some(cmd) = extract_command(node, source) {
-            if piped {
+            if piped && !substitution_has_independent_stdin(node, source) {
                 check_command_for_interpreters(
                     &cmd,
                     &mut flags.pipe_to_shell,
                     &mut flags.pipe_to_interpreter,
                 );
-                let runs = runs_stdin_as_code(node, source, &mut flags.inline_script_ranges);
+                let runs = runs_stdin_as_code(
+                    node,
+                    source,
+                    flags.inline_candidate == Some(node.id()),
+                    &mut flags.inline_script_ranges,
+                );
                 flags.remote_source_to_interpreter |= input_remote && runs;
             }
             // Most commands may forward/transform stdin. Only known producers
             // replace it; notably `nc | (printf x | python3)` stays exempt.
-            let replaces_input =
-                matches!(cmd.name.rsplit('/').next().unwrap_or(""), "printf" | "echo");
+            let replaces_input = input_remote
+                && matches!(cmd.name.rsplit('/').next().unwrap_or(""), "printf" | "echo")
+                && command_arguments_are_plain_literals(node, source);
             output_remote = command_is_remote_fetcher(&cmd) || (input_remote && !replaces_input);
         }
     }
@@ -485,9 +588,103 @@ fn check_pipeline_flow(
     // Union sibling outputs because any of them can contribute remote bytes.
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
+        // Pipeline traversal already visits its parent's trailing redirects with
+        // the last stage's input. Do not visit those subtrees a second time.
+        if node.kind() == "redirected_statement"
+            && node
+                .child_by_field_name("body")
+                .is_some_and(|body| body.kind() == "pipeline")
+            && child.kind().ends_with("_redirect")
+        {
+            continue;
+        }
         output_remote |= check_pipeline_flow(&child, source, input_remote, piped, flags);
     }
     output_remote
+}
+
+/// Only the immediate command in an argument substitution can replace its
+/// inherited pipe input. Redirect expansions themselves still inherit the pipe
+/// and are visited normally. Preserve pipe classification for stdin aliases and
+/// uncertain destinations/expanded here-documents.
+fn substitution_has_independent_stdin(node: &Node, source: &str) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    let holder = if parent.kind() == "command_substitution" {
+        *node
+    } else if parent.kind() == "redirected_statement"
+        && parent.child_by_field_name("body") == Some(*node)
+        && parent
+            .parent()
+            .is_some_and(|p| p.kind() == "command_substitution")
+    {
+        parent
+    } else {
+        return false;
+    };
+    let mut cursor = holder.walk();
+    let redirects: Vec<_> = holder
+        .named_children(&mut cursor)
+        .filter(|child| child.kind().ends_with("_redirect"))
+        .collect();
+    // Multiple redirects and explicit descriptors need ordered descriptor
+    // resolution. Retain the conservative denial for those uncertain forms.
+    if redirects.len() != 1 {
+        return false;
+    }
+    let independent = redirects.into_iter().any(|redirect| {
+        if redirect.start_byte() > 0
+            && source.as_bytes()[redirect.start_byte() - 1].is_ascii_digit()
+        {
+            return false;
+        }
+        if contains_kind(&redirect, DYNAMIC_KINDS) {
+            return false;
+        }
+        match redirect.kind() {
+            "herestring_redirect" | "heredoc_redirect" => true,
+            "file_redirect" => {
+                let text = redirect.utf8_text(source.as_bytes()).unwrap_or("");
+                if !text.starts_with('<') || text.starts_with("<&") {
+                    return false;
+                }
+                redirect
+                    .child_by_field_name("destination")
+                    .and_then(|destination| decode_literal_word(&destination, source))
+                    .is_some_and(|path| {
+                        !path.is_empty()
+                            && (!path.starts_with("/dev/") || path == "/dev/null")
+                            && !path.starts_with("/proc/")
+                    })
+            }
+            _ => false,
+        }
+    });
+    independent
+}
+
+/// Producers clear provenance only when no expansion, substitution or redirect
+/// could read stdin (including Bash's commandless `$(< /dev/stdin)`).
+fn command_arguments_are_plain_literals(node: &Node, source: &str) -> bool {
+    if node
+        .parent()
+        .is_some_and(|parent| parent.kind() == "redirected_statement")
+        || node.parent().is_some_and(|parent| {
+            parent.kind() == "pipeline"
+                && parent
+                    .parent()
+                    .is_some_and(|p| p.kind() == "redirected_statement")
+                && parent.named_child(parent.named_child_count() - 1) == Some(*node)
+        })
+    {
+        return false;
+    }
+    let mut cursor = node.walk();
+    let literal = node.children(&mut cursor).all(|child| {
+        child.kind() == "command_name" || decode_literal_word(&child, source).is_some()
+    });
+    literal
 }
 
 /// Whether a command is (or wraps, via sudo/env/timeout/…) a remote fetcher.
@@ -565,14 +762,19 @@ fn interpreter_kind(name: &str) -> Option<Interp> {
 /// interpreter behind a wrapper (`xargs python3 -c`, `env python3 …`). An
 /// Python interpreter invoked directly with allowlisted literal code reads stdin as
 /// data; its range is recorded in `inline_ranges` and it does not count.
-fn runs_stdin_as_code(node: &Node, source: &str, inline_ranges: &mut Vec<Range<usize>>) -> bool {
+fn runs_stdin_as_code(
+    node: &Node,
+    source: &str,
+    inline_candidate: bool,
+    inline_ranges: &mut Vec<Range<usize>>,
+) -> bool {
     let Some(cmd) = extract_command(node, source) else {
         return false;
     };
     match interpreter_kind(&cmd.name) {
         Some(Interp::Shell) => true,
         Some(kind) => {
-            if is_inline_literal_script(node, source, kind) {
+            if inline_candidate && is_inline_literal_script(node, source, kind) {
                 inline_ranges.push(node.byte_range());
                 false
             } else {
@@ -592,10 +794,11 @@ fn runs_stdin_as_code(node: &Node, source: &str, inline_ranges: &mut Vec<Range<u
                 .skip(1)
                 .filter(|child| !child.kind().ends_with("_redirect"))
                 .any(|arg| {
-                    // Wrappers can reparse arguments as command text. Decode
-                    // them too, and treat uncertain values as code.
+                    // Only env split-string reparses uncertain command text.
+                    // Ordinary wrapper markers/globs/variables are not by
+                    // themselves evidence of an interpreter.
                     let Some(value) = decode_literal_word(&arg, source) else {
-                        return true;
+                        return false;
                     };
                     (base == "env" && env_splits_string(&value))
                         || value
@@ -891,14 +1094,6 @@ fn inline_data_stage_is_safe(name: &str, args: &[String]) -> bool {
         "cut" => (&[], &[("d", Literal), ("f", Literal)]),
         "uniq" => (&["c"], &[]),
         "wc" => (&["l", "c", "w"], &[]),
-        "nc" => {
-            return args.len() == 2
-                && !args[0].is_empty()
-                && !args[0].starts_with('-')
-                && !args[0].contains(char::is_whitespace)
-                && data_flag_operand_is_safe(Integer, &args[1])
-                && args[1].parse::<u16>().is_ok_and(|port| port > 0);
-        }
         // Retain the existing echo-curl-as-data ALLOW test. Echo cannot write
         // files; excluding leading '-' operands avoids all option parsing.
         "echo" => return args.iter().all(|arg| !arg.starts_with('-')),
@@ -1212,55 +1407,18 @@ fn check_command_for_interpreters(
     has_pipe_to_shell: &mut bool,
     has_pipe_to_interpreter: &mut bool,
 ) {
-    let normalized_name = cmd.name.to_lowercase();
-
-    // Direct interpreter check
-    if SHELL_INTERPRETERS.contains(normalized_name.as_str()) {
-        *has_pipe_to_shell = true;
-        return;
-    }
-    if SCRIPT_INTERPRETERS.contains(normalized_name.as_str()) {
-        *has_pipe_to_interpreter = true;
-        return;
-    }
-
-    // Check if this is a wrapper command
-    // If so, check the arguments for interpreters
-    if PIPELINE_WRAPPERS.contains(normalized_name.as_str()) && !cmd.arguments.is_empty() {
-        // For wrapper commands, check all arguments for interpreter names
-        // This catches: xargs bash, xargs sh -c, env bash, sudo bash, etc.
+    let mut classify = |name: &str| match interpreter_kind(name) {
+        Some(Interp::Shell) => *has_pipe_to_shell = true,
+        Some(_) => *has_pipe_to_interpreter = true,
+        None => {}
+    };
+    classify(&cmd.name);
+    let lower = cmd.name.to_lowercase();
+    let base = lower.rsplit('/').next().unwrap_or("");
+    if PIPELINE_WRAPPERS.contains(base) {
         for arg in &cmd.arguments {
-            let arg_lower = arg.to_lowercase();
-            // Skip flags
-            if arg_lower.starts_with('-') {
-                continue;
-            }
-            // Check if this argument is an interpreter
-            if SHELL_INTERPRETERS.contains(arg_lower.as_str()) {
-                *has_pipe_to_shell = true;
-                return;
-            }
-            if SCRIPT_INTERPRETERS.contains(arg_lower.as_str()) {
-                *has_pipe_to_interpreter = true;
-                return;
-            }
-            // Also check for path-based interpreter names
-            if arg_lower.ends_with("/sh")
-                || arg_lower.ends_with("/bash")
-                || arg_lower.ends_with("/zsh")
-                || arg_lower.ends_with("/dash")
-            {
-                *has_pipe_to_shell = true;
-                return;
-            }
-            if arg_lower.ends_with("/python")
-                || arg_lower.ends_with("/python3")
-                || arg_lower.ends_with("/ruby")
-                || arg_lower.ends_with("/perl")
-                || arg_lower.ends_with("/node")
-            {
-                *has_pipe_to_interpreter = true;
-                return;
+            for token in arg.split_whitespace() {
+                classify(token);
             }
         }
     }
@@ -1284,6 +1442,32 @@ pub fn has_command(analysis: &CommandAnalysis, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_analysis_worker_panic_fails_closed() {
+        let analysis = on_analysis_stack(|| panic!("simulated AST worker failure"));
+        assert!(analysis.too_complex);
+        assert!(!analysis.parsed);
+        assert!(analysis.commands.is_empty());
+        assert_eq!(analysis.error, too_complex_analysis().error);
+    }
+
+    #[test]
+    fn test_ast_depth_boundary_uses_large_worker_stack() {
+        // The deepest word is two levels below the number of chained commands.
+        for (count, allowed) in [(MAX_AST_DEPTH - 2, true), (MAX_AST_DEPTH - 1, false)] {
+            let command = std::iter::repeat_n("echo step", count)
+                .collect::<Vec<_>>()
+                .join(" && ");
+            let start = std::time::Instant::now();
+            let analysis = analyze_command(&command);
+            let elapsed = start.elapsed();
+            assert_eq!(analysis.parsed, allowed);
+            assert_eq!(analysis.too_complex, !allowed);
+            eprintln!("depth cap boundary: allowed={allowed}, elapsed={elapsed:?}");
+            assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
+        }
+    }
 
     fn assert_remote_flow(command: &str, executes: bool) {
         let analysis = analyze_command(command);
