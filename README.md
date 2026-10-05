@@ -196,32 +196,38 @@ Existing Python interpreter paths remain supported.
 
 | Stage | Allowed flags and operands |
 | --- | --- |
-| `curl` | `-s -S -f -L -4 -6 --compressed`; `-H HEADER -A AGENT -m SECONDS --max-time SECONDS --connect-timeout SECONDS --retry N`; HTTP(S) URL operands |
-| `wget` | `-q -S -4 -6 --quiet --server-response`; `-T SECONDS -t N --timeout SECONDS --tries N --header HEADER --user-agent AGENT`; HTTP(S) URL operands; **requires** the exact stdout-only option `-qO-` or `-O-` |
-| `jq` | `-r -c -e -s` and exactly one literal filter |
+| `curl` | **Requires standalone `-q` as the first argument**; then `-s -S -f -L -4 -6 --compressed`; `-H HEADER -A AGENT -m SECONDS --max-time SECONDS --connect-timeout SECONDS --retry N`; HTTP(S) URL operands |
 | `cat` | No flags or operands; reads stdin |
 | `head`, `tail` | `-n N`; reads stdin |
 | `grep` | `-E -F -i -v -o -m N` and exactly one literal pattern |
 | `cut` | `-d DELIMITER -f FIELDS`; reads stdin |
 | `tr` | No flags; exactly two literal set operands |
-| `sort` | `-u -r -n`; reads stdin |
 | `uniq` | `-c`; reads stdin |
 | `wc` | `-l -c -w`; reads stdin |
 | `nc` | No flags; exactly a host and a numeric port (1–65535) |
 | `echo` | No flags; literal words that do not start with `-` |
 
 For these data stages, short flags without operands can be combined (such as
-`curl -sSL`, `curl -fsSL` or `jq -rc`). Flags with operands require a separate literal word; attached
-values, long-option abbreviations, `--flag=value`, and `--` are excluded, apart
-from the exact wget stdout options above. Counts are nonnegative decimal
+`curl -q -sSL` or `curl -q -fsSL`). Curl's first argument must be exactly `-q`
+to suppress `.curlrc`; omitted, later, clustered (`-qs`, `-sq`) and long-form
+spellings get no exemption. Flags with operands require a separate literal word;
+attached values, long-option abbreviations, `--flag=value`, and `--` are excluded.
+Counts are nonnegative decimal
 integers; timeouts are finite nonnegative numbers. Header, agent, delimiter and
 field operands must be nonempty and cannot start with `-` or `@`. Filters accept
-no file operands. Wget without a stdout option is excluded because its default
-behavior writes downloaded files.
+no file operands. Wget is excluded entirely because startup configs and HSTS
+state can cause writes even with stdout downloads. Sort is excluded because
+large inputs can spill to temporary files. Jq is excluded because it
+[automatically sources `~/.jq` when it is a file](https://jqlang.org/manual/#modules).
 
 File-writing redirections on **any stage**, including Python and stages after
 it, disqualify the exemption (`>`, `>>`, `&>`, `>|`, `<>`, and other unlisted
-forms). Only `2>/dev/null`, `2>&1` and `>&2` are supported. Variable assignments
+forms). Only the byte-exact spellings `2>/dev/null`, `2>&1` and `>&2` are
+supported; spacing or quoting variants get no exemption. Command and flag words,
+operands and redirection destinations containing non-ASCII whitespace or control
+characters get no exemption. Unicode whitespace is never stripped or normalized
+into an allowed spelling. Python code uses its own lexer and may contain tabs
+and newlines. Variable assignments
 are excluded apart from the Python stage's own checked harmless prefixes (such
 as `LC_ALL=C`). The existing `PYTHON*` token and uncertain-argument checks remain
 as defence in depth.
@@ -299,9 +305,9 @@ strings); named Unicode escapes are unsupported. Raw strings preserve escapes.
 For example, these remote data pipelines remain allowed:
 
 ```bash
-curl -s https://api.example/data | python3 -c 'import json,sys; print(json.load(sys.stdin)["x"])'
-curl -s https://api.example/data | python3 -c 'import sys; print(len(sys.stdin.read().splitlines()))'
-curl -s https://api.example/data | python3 -c 'import json,sys; print(sum(row["amount"] for row in json.load(sys.stdin)))'
+curl -q -s https://api.example/data | python3 -c 'import json,sys; print(json.load(sys.stdin)["x"])'
+curl -q -s https://api.example/data | python3 -c 'import sys; print(len(sys.stdin.read().splitlines()))'
+curl -q -s https://api.example/data | python3 -c 'import json,sys; print(sum(row["amount"] for row in json.load(sys.stdin)))'
 ```
 
 ## Safety Levels
