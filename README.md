@@ -161,8 +161,9 @@ block_variable_commands = true
 
 # Block piping to a shell (any source), and remote content (fetchers such as
 # curl, wget, nc) into an interpreter at any later stage. An interpreter
-# running an inline literal script (python3 -c '...', ruby -e, perl -ne,
-# node -e, php -r) reads the fetched bytes as data and is allowed.
+# running python3 -c with a literal script is exempt only when its code
+# passes the explicit data-processing allowlist below. Unknown code fails closed.
+# Ruby, Perl, Node and PHP have no inline-script exemption.
 block_pipe_to_shell = true
 
 [files]
@@ -173,6 +174,75 @@ protected_patterns = [
     "\\.aws/credentials",
     "\\.pem$",
 ]
+```
+
+## Python inline-script exemption
+
+Fetched content piped into `python3 -c '<literal>'` is treated as data only when a
+small lexer and restricted parser accept **every name, call and attribute**.
+This is an allowlist, not a search for known execution primitives. Unknown,
+dynamic, malformed or unsupported code gets no exemption and the remote-pipe
+rule blocks it. Existing checks on environment prefixes, interpreter flags,
+shell literals, expansions and arguments still apply.
+
+Ruby, Perl, Node and PHP have **empty inline-code allowlists**: their inline
+scripts remain blocked after a remote fetch. They need separate, demonstrably
+safe parsers before an exemption can be restored. Local-source pipeline behavior
+is unchanged.
+
+The exact Python name allowlist is:
+
+| Context | Allowed names |
+|---------|---------------|
+| Keywords and constants | `for, in, if, else, not, and, or, is, import, from, lambda, True, False, None` |
+| Builtins | `print, len, sum, min, max, abs, round, int, float, str, bool, list, dict, set, tuple, sorted, reversed, enumerate, zip, range, map, filter, any, all` |
+| Fixed local names | `x, y, i, n, row, item, line, data, value, key, match` |
+| Keyword argument labels | `indent, sort_keys, ensure_ascii, sep, end, key, reverse, default, flags` |
+| Methods on data expressions | `get, keys, values, items, append, extend, split, splitlines, rsplit, strip, lstrip, rstrip, join, count, startswith, endswith, lower, upper, replace, format, index, find, sort, most_common, group, groups` |
+| json members | `load, loads, dump, dumps` |
+| sys members | `argv, exit` |
+| re members | `findall, match, search, sub, split, compile` |
+| csv members | `reader, DictReader, writer` |
+| collections members | `Counter, defaultdict, OrderedDict` |
+| itertools members | `accumulate, chain, combinations, combinations_with_replacement, compress, count, cycle, dropwhile, filterfalse, groupby, islice, pairwise, permutations, product, repeat, starmap, takewhile, tee, zip_longest` |
+| math members | `acos, acosh, asin, asinh, atan, atan2, atanh, ceil, comb, copysign, cos, cosh, degrees, dist, erf, erfc, exp, exp2, expm1, fabs, factorial, floor, fmod, frexp, fsum, gamma, gcd, hypot, isclose, isfinite, isinf, isnan, isqrt, lcm, ldexp, lgamma, log, log10, log1p, log2, modf, nextafter, perm, pow, prod, radians, remainder, sin, sinh, sqrt, tan, tanh, trunc, ulp, e, inf, nan, pi, tau` |
+
+Imports may use only `json`, `sys`, `re`, `csv`, `collections`, `itertools`, or
+`math`. `from MODULE import NAME` must use an exact member above, without aliases,
+relative paths or `*`; `from re import compile` is rejected so bare `compile`
+never becomes allowed. Qualified `re.compile` is safe regex compilation.
+`itertools` and `math` use the explicit members above, **not wildcard access**.
+
+`sys.stdin` is allowed only before `.read`, `.readline` or `.readlines`, as the
+iterable of a `for` (including comprehensions), or as the first positional
+argument of `json.load` (also imported `load`). `sys.stdout` is allowed only
+before `.write` or as the second positional argument of `json.dump` (also
+imported `dump`). `sys.stdin.buffer`, `sys.modules`, other stream attributes,
+module objects used as values, and computed callees are rejected. A local may
+hold data or be passed to an allowlisted function, but cannot be called directly.
+
+The grammar supports expressions, literal containers, indexing/slicing,
+allowlisted calls and keyword arguments, simple assignments to fixed locals,
+semicolon-separated simple statements, conditional expressions, simple one-line
+`if`/`for` suites, comprehensions, and lambdas with fixed local parameters and
+allowlisted bodies. Walrus targets must be fixed local names. It rejects
+`def`, `class`, indented suites, aliases, unpacking, decorators, backticks,
+backslash continuations outside strings, non-ASCII identifiers and dunder names.
+Nesting is limited to 64 levels and scripts to 4096 tokens.
+
+Strings and comments are data, not names to scan. Plain strings and case-insensitive
+`r`, `b`, `br`, `rb` prefixes are supported; f-strings, template strings, `u` prefixes,
+triple quotes, malformed escapes and uncertain literal syntax are rejected.
+Escaped quotes/backslashes, standard single-character escapes, octal escapes and
+complete hexadecimal/Unicode escapes are supported (Unicode escapes only in text
+strings); named Unicode escapes are unsupported. Raw strings preserve escapes.
+
+For example, these remote data pipelines remain allowed:
+
+```bash
+curl -s https://api.example/data | python3 -c 'import json,sys; print(json.load(sys.stdin)["x"])'
+curl -s https://api.example/data | python3 -c 'import sys; print(len(sys.stdin.read().splitlines()))'
+curl -s https://api.example/data | python3 -c 'import json,sys; print(sum(row["amount"] for row in json.load(sys.stdin)))'
 ```
 
 ## Safety Levels

