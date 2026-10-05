@@ -72,7 +72,6 @@ const METHODS: &[&str] = &[
     "lower",
     "upper",
     "replace",
-    "format",
     "index",
     "find",
     "sort",
@@ -188,7 +187,9 @@ enum Token<'a> {
 /// literals. Escapes inside strings are data; escapes outside them are rejected.
 fn lex(code: &str) -> Option<Vec<Token<'_>>> {
     let bytes = code.as_bytes();
-    if bytes.contains(&0) {
+    // Reject these everywhere, including inside comments and string literals.
+    // Python treats CR as a newline; skipping it in a comment hides statements.
+    if bytes.iter().any(|b| matches!(b, 0 | b'\r' | 0x0c)) {
         return None;
     }
     let mut tokens = Vec::new();
@@ -199,18 +200,15 @@ fn lex(code: &str) -> Option<Vec<Token<'_>>> {
         let mut raw = false;
         let mut byte_string = false;
         match bytes[i] {
-            b' ' | b'\t' | b'\r' => {
+            b' ' | b'\t' => {
                 if brackets.is_empty() && (i == 0 || bytes[i - 1] == b'\n') {
-                    while matches!(bytes.get(i), Some(b' ' | b'\t' | b'\r')) {
+                    while matches!(bytes.get(i), Some(b' ' | b'\t')) {
                         i += 1;
                     }
                     if matches!(bytes.get(i), None | Some(b'\n' | b'#')) {
                         continue;
                     }
                     return None; // No indented suites in this grammar.
-                }
-                if bytes[i] == b'\r' {
-                    return None;
                 }
                 i += 1;
                 continue;

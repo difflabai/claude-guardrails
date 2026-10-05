@@ -185,6 +185,15 @@ dynamic, malformed or unsupported code gets no exemption and the remote-pipe
 rule blocks it. Existing checks on environment prefixes, interpreter flags,
 shell literals, expansions and arguments still apply.
 
+Double-quoted shell words are decoded using bash's backslash rules before the
+Python allowlist runs. CR, NUL and form feed are rejected anywhere in the code;
+tabs remain supported. Uncertain shell word kinds get no exemption.
+
+Before `-c`, Python `-W` accepts only the bare actions `ignore`, `default`,
+`error`, `always`, `module` and `once`, with no colon fields. `-X` accepts only
+`utf8`, `utf8=0` and `utf8=1`. These restrictions apply to both separate and
+attached operands; all other `-W`/`-X` settings get no exemption.
+
 Ruby, Perl, Node and PHP have **empty inline-code allowlists**: their inline
 scripts remain blocked after a remote fetch. They need separate, demonstrably
 safe parsers before an exemption can be restored. Local-source pipeline behavior
@@ -198,7 +207,7 @@ The exact Python name allowlist is:
 | Builtins | `print, len, sum, min, max, abs, round, int, float, str, bool, list, dict, set, tuple, sorted, reversed, enumerate, zip, range, map, filter, any, all` |
 | Fixed local names | `x, y, i, n, row, item, line, data, value, key, match` |
 | Keyword argument labels | `indent, sort_keys, ensure_ascii, sep, end, key, reverse, default, flags` |
-| Methods on data expressions | `get, keys, values, items, append, extend, split, splitlines, rsplit, strip, lstrip, rstrip, join, count, startswith, endswith, lower, upper, replace, format, index, find, sort, most_common, group, groups` |
+| Methods on data expressions | `get, keys, values, items, append, extend, split, splitlines, rsplit, strip, lstrip, rstrip, join, count, startswith, endswith, lower, upper, replace, index, find, sort, most_common, group, groups` |
 | json members | `load, loads, dump, dumps` |
 | sys members | `argv, exit` |
 | re members | `findall, match, search, sub, split, compile` |
@@ -212,6 +221,10 @@ Imports may use only `json`, `sys`, `re`, `csv`, `collections`, `itertools`, or
 relative paths or `*`; `from re import compile` is rejected so bare `compile`
 never becomes allowed. Qualified `re.compile` is safe regex compilation.
 `itertools` and `math` use the explicit members above, **not wildcard access**.
+
+`format` was removed from the allowed methods because replacement fields can
+traverse attributes and indexes. `format_map` is also excluded. Percent (`%`)
+formatting remains supported; f-strings remain rejected.
 
 `sys.stdin` is allowed only before `.read`, `.readline` or `.readlines`, as the
 iterable of a `for` (including comprehensions), or as the first positional
