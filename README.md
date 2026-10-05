@@ -236,6 +236,9 @@ Modules already in the working directory (such as a planted `json.py`) and the
 environment inherited from **outside the command** (such as `PYTHONWARNINGS` or
 `PYTHONSTARTUP` set in the user's shell profile) are not visible to this hook;
 the allowlist cannot defend against them.
+Environment inherited from outside the command, such as `SSLKEYLOGFILE`, can make
+curl append to a file even with `-q`; this is a side effect with no known path to
+code execution in the Python stage.
 
 Double-quoted shell words are decoded using bash's backslash rules before the
 Python allowlist runs. CR, NUL and form feed are rejected anywhere in the code;

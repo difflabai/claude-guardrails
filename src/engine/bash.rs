@@ -942,6 +942,35 @@ mod tests {
     }
 
     #[test]
+    fn test_uun17_curl_brace_glob_allowed() {
+        // URL globbing alone does not select an output file.
+        let cmd = "curl -q 'https://x/{a,b}.json' | python3 -c 'print(1)'";
+        assert!(check(cmd).is_allow(), "{cmd}");
+        let analysis = ast::analyze_command(cmd);
+        assert!(analysis.parsed, "{cmd}");
+        assert!(!analysis.has_remote_source_to_interpreter, "{cmd}");
+        assert_eq!(analysis.inline_script_ranges.len(), 1, "{cmd}");
+    }
+
+    #[test]
+    fn test_uun17_curl_range_glob_allowed() {
+        // URL globbing alone does not select an output file.
+        let cmd = "curl -q 'https://x/[1-3].json' | python3 -c 'print(1)'";
+        assert!(check(cmd).is_allow(), "{cmd}");
+        let analysis = ast::analyze_command(cmd);
+        assert!(analysis.parsed, "{cmd}");
+        assert!(!analysis.has_remote_source_to_interpreter, "{cmd}");
+        assert_eq!(analysis.inline_script_ranges.len(), 1, "{cmd}");
+    }
+
+    #[test]
+    fn test_uun17_non_allowlisted_descriptor_denied() {
+        let cmd = "curl -q https://x/a | python3 -c 'print(1)' 102>&1";
+        assert_review_denied(cmd);
+        assert!(check(cmd).is_deny(), "{cmd}");
+    }
+
+    #[test]
     fn test_uun15_fail_closed_regressions() {
         for cmd in [
             "curl -q https://x/a | python3 -c 'print(1)' >&\u{a0}2",
