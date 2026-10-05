@@ -159,7 +159,11 @@ wrappers = ["sudo", "timeout", "xargs", "env", "nice", "nohup", "ionice", "strac
 # Block $cmd, $(cmd), `cmd` at command start
 block_variable_commands = true
 
-# Block | sh, | bash, | python
+# Block piping to a shell (any source), and remote content (fetchers such as
+# curl, wget, nc) into an interpreter at any later stage. An interpreter
+# running python3 -c with a literal script is exempt only when its code
+# passes the explicit data-processing allowlist below. Unknown code fails closed.
+# Ruby, Perl, Node and PHP have no inline-script exemption.
 block_pipe_to_shell = true
 
 [files]
@@ -170,6 +174,194 @@ protected_patterns = [
     "\\.aws/credentials",
     "\\.pem$",
 ]
+```
+
+## Python inline-script exemption
+
+Fetched content piped into `python3 -c '<literal>'` is treated as data only when a
+small lexer and restricted parser accept **every name, call and attribute**.
+This is an allowlist, not a search for known execution primitives. Unknown,
+dynamic, malformed or unsupported code gets no exemption and the remote-pipe
+rule blocks it. Existing checks on environment prefixes, interpreter flags,
+shell literals, expansions and arguments still apply.
+
+The **entire command must parse as a single pipeline of plain simple commands**.
+Lists (`;`, `&`, `&&`, `||`), additional statements, functions, subshells, brace
+groups, compound commands, negation, heredocs and here-strings get no exemption.
+Every command name must be a plain literal word. Every stage other than the
+checked Python stage must belong to the following **closed allowlist**; unknown
+commands or flags disqualify the whole exemption. Non-Python command paths and
+quoted command names are excluded, including quoted names of allowed commands.
+Existing Python interpreter paths remain supported.
+
+| Stage | Allowed flags and operands |
+| --- | --- |
+| `curl` | **Requires standalone `-q` as the first argument**; then `-s -S -f -L -4 -6 --compressed`; `-H HEADER -A AGENT -m SECONDS --max-time SECONDS --connect-timeout SECONDS --retry N`; HTTP(S) URL operands |
+| `cat` | No flags or operands; reads stdin |
+| `head`, `tail` | `-n N`; reads stdin |
+| `grep` | `-E -F -i -v -o -m N` and exactly one nonempty literal pattern |
+| `cut` | `-d DELIMITER -f FIELDS`; reads stdin |
+| `tr` | No flags; exactly two literal set operands |
+| `uniq` | `-c`; reads stdin |
+| `wc` | `-l -c -w`; reads stdin |
+| `echo` | No flags; literal words that do not start with `-` |
+
+For these data stages, short flags without operands can be combined (such as
+`curl -q -sSL` or `curl -q -fsSL`). Curl's first argument must be exactly `-q`
+to suppress `.curlrc`; omitted, later, clustered (`-qs`, `-sq`) and long-form
+spellings get no exemption. Flags with operands require a separate literal word;
+attached values, long-option abbreviations, `--flag=value`, and `--` are excluded.
+Counts are nonnegative decimal
+integers; timeouts are finite nonnegative numbers. Header, agent, delimiter and
+field operands must be nonempty and cannot start with `-` or `@`. Filters accept
+no file operands. Nc is excluded because it can forward fetched bytes to local
+services, including commands that mutate service state. Wget is excluded entirely because startup configs and HSTS
+state can cause writes even with stdout downloads. Sort is excluded because
+large inputs can spill to temporary files. Jq is excluded because it
+[automatically sources `~/.jq` when it is a file](https://jqlang.org/manual/#modules).
+
+File-writing redirections on **any stage**, including Python and stages after
+it, disqualify the exemption (`>`, `>>`, `&>`, `>|`, `<>`, and other unlisted
+forms). Only the byte-exact spellings `2>/dev/null`, `2>&1` and `>&2` are
+supported; spacing or quoting variants get no exemption. Command and flag words,
+operands and redirection destinations containing non-ASCII whitespace or control
+characters get no exemption. Unicode whitespace is never stripped or normalized
+into an allowed spelling. Python code uses its own lexer and may contain tabs
+and newlines. Variable assignments
+are excluded apart from the Python stage's own checked harmless prefixes (such
+as `LC_ALL=C`). The existing `PYTHON*` token and uncertain-argument checks remain
+as defence in depth.
+
+Modules already in the working directory (such as a planted `json.py`) and the
+environment inherited from **outside the command** (such as `PYTHONWARNINGS` or
+`PYTHONSTARTUP` set in the user's shell profile) are not visible to this hook;
+the allowlist cannot defend against them. Python startup hooks outside the working
+directory are also trusted: user-site `.pth` import lines, `sitecustomize`,
+`usercustomize`, and virtual-environment startup hooks can execute code before
+`-c`, including code that reads stdin. Ordinary imports can write `.pyc` files.
+Executable lookup and shell function resolution must be trusted; this hook does
+not verify that an allowed command name resolves to the intended executable.
+Environment inherited from outside the command, such as `SSLKEYLOGFILE`, can make
+curl append TLS secrets to a file even with `-q`, exposing secrets that permit
+decryption of captured traffic.
+
+Known pre-existing fail-open paths remain: invalid UTF-8 hook input can return
+`{}` with exit status 0 because stdin line decoding fails before JSON parsing.
+An AST parse error falls back to the regex path, which can miss syntax or
+obfuscation that AST analysis would detect. These are outside this fix's scope.
+
+Double-quoted shell words are decoded using bash's backslash rules before the
+Python allowlist runs. CR, NUL and form feed are rejected anywhere in the code;
+tabs remain supported. Uncertain shell word kinds get no exemption.
+
+Accepted interpreter spellings include `python`, `pypy`, version suffixes (such
+as `python3.12` and `pypy3`), and paths to these names. Before `-c`, the accepted
+leading flags are `-u -B -E -s -S -I -O -OO -q -b -bb -P`, plus the restricted
+`-W` and `-X` forms below.
+
+Python `-W` accepts only the bare actions `ignore`, `default`,
+`error`, `always`, `module` and `once`, with no colon fields. `-X` accepts only
+`utf8`, `utf8=0` and `utf8=1`. These restrictions apply to both separate and
+attached operands; all other `-W`/`-X` settings get no exemption.
+
+Ruby, Perl, Node and PHP have **empty inline-code allowlists**: their inline
+scripts remain blocked after a remote fetch. They need separate, demonstrably
+safe parsers before an exemption can be restored. Local-source pipeline behavior
+is unchanged.
+
+The exact Python name allowlist is:
+
+| Context | Allowed names |
+|---------|---------------|
+| Keywords and constants | `for, in, if, else, not, and, or, is, import, from, lambda, True, False, None` |
+| Builtins | `print, len, sum, min, max, abs, round, int, float, str, bool, list, dict, set, tuple, sorted, reversed, enumerate, zip, range, map, filter, any, all` |
+| Fixed local names | `x, y, i, n, row, item, line, data, value, key, match` |
+| Keyword argument labels | `indent, sort_keys, ensure_ascii, sep, end, key, reverse, default, flags` |
+| Methods on data expressions | `get, keys, values, items, append, extend, split, splitlines, rsplit, strip, lstrip, rstrip, join, count, startswith, endswith, lower, upper, replace, index, find, sort, most_common, group, groups` |
+| json members | `load, loads, dump, dumps` |
+| sys members | `argv, exit` |
+| re members | `findall, match, search, sub, split, compile` |
+| csv members | `reader, DictReader, writer` |
+| collections members | `Counter, defaultdict, OrderedDict` |
+| itertools members | `accumulate, chain, combinations, combinations_with_replacement, compress, dropwhile, filterfalse, groupby, islice, pairwise, permutations, product, starmap, takewhile, tee, zip_longest` |
+| math members | `acos, acosh, asin, asinh, atan, atan2, atanh, ceil, comb, copysign, cos, cosh, degrees, dist, erf, erfc, exp, exp2, expm1, fabs, factorial, floor, fmod, frexp, fsum, gamma, gcd, hypot, isclose, isfinite, isinf, isnan, isqrt, lcm, ldexp, lgamma, log, log10, log1p, log2, modf, nextafter, perm, pow, prod, radians, remainder, sin, sinh, sqrt, tan, tanh, trunc, ulp, e, inf, nan, pi, tau` |
+
+Imports may use only `json`, `sys`, `re`, `csv`, `collections`, `itertools`, or
+`math`. `from MODULE import NAME` must use an exact member above, without aliases,
+relative paths or `*`; `from re import compile` is rejected so bare `compile`
+never becomes allowed. Qualified `re.compile` is safe regex compilation.
+`itertools` and `math` use the explicit members above, **not wildcard access**.
+
+`format` was removed from the allowed methods because replacement fields can
+traverse attributes and indexes. `format_map` is also excluded. Percent (`%`)
+formatting remains supported; f-strings remain rejected.
+
+`sys.stdin` is allowed only before `.read`, `.readline` or `.readlines`, as the
+iterable of a `for` (including comprehensions), or as the first positional
+argument of `json.load` (also imported `load`). `sys.stdout` is allowed only
+before `.write` or as the second positional argument of `json.dump` (also
+imported `dump`). `sys.stdin.buffer`, `sys.modules`, other stream attributes,
+module objects used as values, and computed callees are rejected. A local may
+hold data or be passed to an allowlisted function, but cannot be called directly.
+
+The grammar supports expressions, literal containers, indexing/slicing,
+allowlisted calls and keyword arguments, simple assignments to fixed locals,
+semicolon-separated simple statements, conditional expressions, simple one-line
+`if`/`for` suites, comprehensions, and lambdas with fixed local parameters and
+allowlisted bodies. Walrus targets must be fixed local names. It rejects
+`def`, `class`, indented suites, aliases, unpacking, decorators, backticks,
+backslash continuations outside strings, non-ASCII identifiers and dunder names.
+Python nesting is limited to 64 levels and scripts to 4096 tokens. All Bash
+analysis, including wrapper unwrapping and the regex backstop, runs on a worker
+with a 256 MiB stack. Commands are capped at **1 MiB of UTF-8 command text**
+before parsing, **6,000 AST levels**, **131,072 AST nodes**, and **128 nested
+wrappers**. A **5-second wall-clock deadline** covers the worker's entire
+analysis; the caller uses a timed receive and joins completed workers. On a
+timeout it returns a decision without waiting for the worker, which terminates
+when the hook process exits. Worker creation failure and worker or hook-body
+panics also fail closed.
+
+Exceeding any bound returns DENY with rule ID `command-too-complex`, without
+an exemption or regex fallback. This rule is **not overridable with allow-once**.
+Split legitimate commands into smaller invocations.
+
+Pipeline wrappers use per-wrapper option parsing to check the wrapped command
+name; search patterns, printf formats and other arguments after that name are
+data. Unknown options and dynamic or undecodable executable words (including
+globs and escaped pathnames) fail closed in pipelines. All `env -S` /
+`--split-string` forms are also treated as possible interpreters after a
+network fetch. This deliberately rejects some unusual safe invocations.
+
+An interpreter in a pipeline argument's command substitution is treated as
+inheriting pipeline stdin unless its stdin is explicitly detached with
+`< /dev/null` (including `0<`), a literal here-string, a here-document whose
+body has no expansions, or `0<&-`. Redirects are considered in shell order,
+including compound bodies and additional stderr redirects. Other file redirects
+are treated conservatively: even a literal file may be a FIFO or an alias of
+stdin. Descriptor aliases and process substitutions also retain inherited-input
+classification. A literal printf/echo producer clears remote provenance despite
+stdin or stderr redirects; uncertain output descriptor changes remain conservative.
+
+These analysis bounds do not limit the allowed command’s runtime memory or CPU.
+Large JSON inputs,
+large containers, combinatorial operations, and infinite iterators can exhaust
+resources; input-size and execution limits remain the caller's responsibility.
+`itertools.count`, `itertools.cycle`, and `itertools.repeat` are excluded, while
+the finite-input itertools members listed above remain supported.
+
+Strings and comments are data, not names to scan. Plain strings and case-insensitive
+`r`, `b`, `br`, `rb` prefixes are supported; f-strings, template strings, `u` prefixes,
+triple quotes, malformed escapes and uncertain literal syntax are rejected.
+Escaped quotes/backslashes, standard single-character escapes, octal escapes and
+complete hexadecimal/Unicode escapes are supported (Unicode escapes only in text
+strings); named Unicode escapes are unsupported. Raw strings preserve escapes.
+
+For example, these remote data pipelines remain allowed:
+
+```bash
+curl -q -s https://api.example/data | python3 -c 'import json,sys; print(json.load(sys.stdin)["x"])'
+curl -q -s https://api.example/data | python3 -c 'import sys; print(len(sys.stdin.read().splitlines()))'
+curl -q -s https://api.example/data | python3 -c 'import json,sys; print(sum(row["amount"] for row in json.load(sys.stdin)))'
 ```
 
 ## Safety Levels

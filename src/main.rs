@@ -237,6 +237,18 @@ fn run_packs() -> i32 {
 }
 
 fn main() {
+    if std::panic::catch_unwind(hook_body).is_err() {
+        let output = HookOutput::deny_with_rule(
+            "command-too-complex",
+            "Unexpected failure while analysing hook input",
+        );
+        let mut stdout = io::stdout().lock();
+        let _ = writeln!(stdout, "{}", output.to_json());
+        let _ = stdout.flush();
+    }
+}
+
+fn hook_body() {
     // Subcommand dispatch (before the stdin hook flow).
     let raw: Vec<String> = env::args().collect();
     if let Some(sub) = raw.get(1) {

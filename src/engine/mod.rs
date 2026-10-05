@@ -193,24 +193,24 @@ impl SecurityEngine {
 
     /// Check a bash command
     pub fn check_bash(&self, command: &str) -> Decision {
-        // Self-protection runs first and is not allowlist-overridable: tampering
-        // with the guardrail's own settings or binary is always denied.
-        if let Some(decision) = selfprotect::check_bash(command) {
-            return decision;
+        if command.len() > crate::parser::ast::MAX_COMMAND_BYTES {
+            return bash::too_complex_decision();
         }
-
-        // Check allowlist first
-        if let Some(reason) = self.allowlist.matches("Bash", command) {
-            return Decision::allow(format!("allowlisted: {}", reason));
-        }
-
-        // Use the bash-specific checker
-        bash::check_command(
+        let allowlist = self.allowlist.clone();
+        bash::check_command_with_precheck(
             command,
             &self.config,
             self.safety_level,
             &self.bash_rules,
             &self.exfil_rules,
+            move |command| {
+                // Preserve self-protection priority over configured allowlists.
+                selfprotect::check_bash(command).or_else(|| {
+                    allowlist
+                        .matches("Bash", command)
+                        .map(|reason| Decision::allow(format!("allowlisted: {}", reason)))
+                })
+            },
         )
     }
 
@@ -282,6 +282,23 @@ mod tests {
 
     fn test_engine() -> SecurityEngine {
         SecurityEngine::new(Config::default())
+    }
+
+    #[test]
+    fn test_command_byte_limit_precedes_configured_allowlist() {
+        let mut engine = test_engine();
+        engine.allowlist =
+            CompiledAllowlist::from_config(&crate::rules::allowlist::AllowlistConfig {
+                allow: vec![crate::rules::allowlist::AllowEntry {
+                    pattern: ".*".into(),
+                    reason: "test override".into(),
+                    tool: Some("Bash".into()),
+                }],
+            })
+            .unwrap();
+        let decision = engine.check_bash(&"a".repeat(crate::parser::ast::MAX_COMMAND_BYTES + 1));
+        assert!(decision.is_deny());
+        assert_eq!(decision.rule_id(), Some("command-too-complex"));
     }
 
     #[test]

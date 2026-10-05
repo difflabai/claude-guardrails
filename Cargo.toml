@@ -29,11 +29,11 @@ criterion = "0.5"
 tempfile = "3.0"
 
 [profile.release]
+# Worker panics must unwind so joining the AST thread can return a DENY.
 strip = true
 opt-level = "z"
 lto = true
 codegen-units = 1
-panic = "abort"
 
 [[bench]]
 name = "startup"
