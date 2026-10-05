@@ -781,6 +781,91 @@ mod tests {
     }
 
     #[test]
+    fn test_uun9_whole_command_environment_denied() {
+        assert_review_denied(
+            "export PYTHONWARNINGS=ignore::this.Warning; curl https://x/a | python3 -c 'print(1)'",
+        );
+        for setup in [
+            "export LANG",
+            "declare LANG=C",
+            "typeset LANG=C",
+            "readonly LANG=C",
+            "set -a",
+            "set -o allexport",
+            "LANG=C",
+            "LANG=C TZ=UTC",
+            "env LANG=C true",
+            "env 'LANG=C' true",
+            "echo PYTHONWARNINGS",
+            "echo \"PYTHONSTARTUP\"",
+            "'export' LANG",
+            "declare -a data=(x y)",
+        ] {
+            for cmd in [
+                format!("{setup}; curl https://x/a | python3 -c 'print(1)'"),
+                format!("curl https://x/a | python3 -c 'print(1)'; {setup}"),
+            ] {
+                assert_review_denied(&cmd);
+            }
+        }
+        assert_review_denied("LANG=C curl https://x/a | python3 -c 'print(1)'");
+        assert_review_denied("curl https://x/a | python3 -c 'print(1)' FOO=1");
+        assert_review_denied("curl https://x/a | LC_ALL=C python3 -c 'print(1)' | LANG=C cat");
+        for cmd in [
+            "curl https://x/a | python3 -c 'print(1)'",
+            "curl https://x/a | LC_ALL=C python3 -c 'print(1)'",
+            "curl https://x/a | LANG=C TZ=UTC python3 -c 'print(1)'",
+            "curl https://x/a | python3 -c 'x=1; print(x)'",
+        ] {
+            assert!(check(cmd).is_allow(), "{cmd}");
+            assert_eq!(ast::analyze_command(cmd).inline_script_ranges.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_uun9_every_shell_argument_must_be_literal() {
+        for cmd in [
+            "curl https://x/a | python3 $ -c 'print(1)'",
+            "curl https://x/a | python3 -c $\"print(1)\"",
+            "curl https://x/a | python3 -c$\"print(1)\"",
+            "curl https://x/a | python3 -c 'print(1)' $",
+            "curl https://x/a | python3 -c 'print(1)' $\"data\"",
+            "curl https://x/a | python3 -c 'print(1)' \"$ARG\"",
+            "curl https://x/a | python3 -c 'print(1)' *",
+            // The old regression expected ALLOW for this trailing expansion.
+            // Every argument must now be positively recognized as a literal.
+            "nc host 80 | python3 -c 'print(1)' \"$LABEL\" | cat",
+        ] {
+            assert_review_denied(cmd);
+        }
+        assert!(check("curl https://x/a | python3 -c 'print(1)'").is_allow());
+        assert!(check("curl https://x/a | python3 -c 'print(1)' '$' --flag").is_allow());
+    }
+
+    #[test]
+    fn test_uun9_p3_exact_denied_strings() {
+        for cmd in [
+            "curl https://x/a | python3 -c 'print(1)\u{b}print(2)'",
+            "curl https://x/a | python3 -c 'print(1)\u{2028}print(2)'",
+            r#"curl https://x/a | python3 -c 'import json; print(json.loads("{}",object_hook=print))'"#,
+            r#"curl https://x/a | python3 -c 'import json; print(json.dumps({},cls=dict))'"#,
+        ] {
+            assert_review_denied(cmd);
+        }
+    }
+
+    #[test]
+    fn test_uun9_p3_exact_allowed_strings() {
+        for cmd in [
+            "curl https://x/a | python3 -c 'print(1)#\u{2028}print(2)'",
+            r#"curl https://x/a | python3 -c 'import collections; print(collections.defaultdict(list)["x"])'"#,
+        ] {
+            assert!(check(cmd).is_allow(), "{cmd:?}");
+            assert_eq!(ast::analyze_command(cmd).inline_script_ranges.len(), 1);
+        }
+    }
+
+    #[test]
     fn test_uun7_p3_exact_allowed_strings() {
         for cmd in [
             "curl https://x/a | python3 -c 'print(\t1)'",
@@ -1035,8 +1120,8 @@ mod tests {
             // attached code and flag operands
             "nc host 80 | python3 -c'print(1)' | cat",
             "nc host 80 | python3 -W ignore -c 'print(1)' | cat",
-            // Python's words after the code are sys.argv
-            "nc host 80 | python3 -c 'print(1)' \"$LABEL\" | cat",
+            // Literal words after the code are sys.argv.
+            "nc host 80 | python3 -c 'print(1)' label | cat",
             // locale prefix
             "nc host 80 | LC_ALL=C python3 -c 'print(1)' | cat",
         ] {

@@ -646,8 +646,9 @@ fn contains_kind(node: &Node, kinds: &[&str]) -> bool {
 /// - Python code must parse within the explicit data-processing allowlist;
 ///   other interpreter families have no inline-code exemption.
 fn is_inline_literal_script(node: &Node, source: &str, kind: Interp) -> bool {
-    // (decoded shell value, literal?) per argument, in order.
-    let mut args: Vec<(String, bool)> = Vec::new();
+    // Account for every argv node, including anonymous tokens such as `$`.
+    let mut args = Vec::new();
+    let mut arg_nodes = Vec::new();
     let mut seen_name = false;
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -662,29 +663,27 @@ fn is_inline_literal_script(node: &Node, source: &str, kind: Interp) -> bool {
             if !is_harmless_assignment(&child, source) {
                 return false;
             }
-        } else if child.is_named() {
-            args.push(match decode_literal_word(&child, source) {
-                Some(value) => (value, true),
-                None => (String::new(), false),
-            });
+        } else {
+            let Some(value) = decode_literal_word(&child, source) else {
+                return false;
+            };
+            args.push(value);
+            arg_nodes.push(child);
         }
     }
 
     let mut i = 0;
     let code = loop {
-        let Some((a, lit)) = args.get(i) else {
+        let Some(a) = args.get(i) else {
             return false; // no inline-code flag: a script file or stdin
         };
-        if !lit {
-            return false;
-        }
         if let Some(attached) = attached_code(kind, a) {
             i += 1;
             break attached;
         }
         if is_code_flag(kind, a) {
             match args.get(i + 1) {
-                Some((c, true)) => {
+                Some(c) => {
                     i += 2;
                     break c.as_str();
                 }
@@ -696,7 +695,7 @@ fn is_inline_literal_script(node: &Node, source: &str, kind: Interp) -> bool {
         };
         for j in 1..=operands {
             match args.get(i + j) {
-                Some((o, true)) if safe_python_option_operand(a, o) => {}
+                Some(o) if safe_python_option_operand(a, o) => {}
                 _ => return false,
             }
         }
@@ -705,7 +704,77 @@ fn is_inline_literal_script(node: &Node, source: &str, kind: Interp) -> bool {
     if !inline_code_is_allowlisted(kind, code) {
         return false;
     }
-    kind == Interp::Python || args[i..].iter().all(|(a, lit)| *lit && !a.starts_with('-'))
+    let mut root = *node;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    if !inline_environment_is_safe(&root, node, &arg_nodes[i - 1], source) {
+        return false;
+    }
+    kind == Interp::Python || args[i..].iter().all(|a| !a.starts_with('-'))
+}
+
+/// Only this stage's already-checked harmless prefixes may assign variables.
+/// Earlier/sibling statements can change inherited startup settings. Literal
+/// argument checks also catch env-style assignments and quoted builtin names;
+/// uncertain shell values cannot establish a safe command environment.
+fn inline_environment_is_safe(node: &Node, stage: &Node, code_arg: &Node, source: &str) -> bool {
+    match node.kind() {
+        "variable_assignment" => {
+            return node.parent() == Some(*stage)
+                && stage
+                    .child_by_field_name("name")
+                    .is_some_and(|name| node.end_byte() <= name.start_byte())
+                && is_harmless_assignment(node, source);
+        }
+        "variable_assignments" | "declaration_command" => return false,
+        "word" | "number" | "raw_string" | "string" | "concatenation" | "ansi_c_string"
+        | "translated_string" => {
+            let Some(value) = decode_literal_word(node, source) else {
+                return false;
+            };
+            // Python locals inside the checked code are not shell assignments.
+            // Neither is a checked -X operand such as utf8=0.
+            let checked_python_value = node == code_arg
+                || (node.parent() == Some(*stage)
+                    && safe_python_option_operand("-X", &value)
+                    && node.prev_sibling().is_some_and(|previous| {
+                        decode_literal_word(&previous, source).as_deref() == Some("-X")
+                    }));
+            return !value.split_whitespace().any(|token| {
+                token.starts_with("PYTHON")
+                    || (!checked_python_value
+                        && (matches!(
+                            token,
+                            "export" | "declare" | "typeset" | "readonly" | "local" | "set"
+                        ) || is_assignment_token(token)))
+            });
+        }
+        "variable_name" => {
+            return node
+                .utf8_text(source.as_bytes())
+                .is_ok_and(|name| !name.starts_with("PYTHON"));
+        }
+        _ if DYNAMIC_KINDS.contains(&node.kind()) => return false,
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    let safe = node
+        .children(&mut cursor)
+        .all(|child| inline_environment_is_safe(&child, stage, code_arg, source));
+    safe
+}
+
+fn is_assignment_token(token: &str) -> bool {
+    let Some((name, _)) = token.split_once('=') else {
+        return false;
+    };
+    let name = name.strip_suffix('+').unwrap_or(name);
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Decode only shell word kinds whose value we can establish with certainty.
@@ -748,7 +817,7 @@ fn decode_literal_word(node: &Node, source: &str) -> Option<String> {
             let mut value = String::new();
             let mut end = node.start_byte();
             let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
+            for child in node.children(&mut cursor) {
                 if child.start_byte() != end {
                     return None;
                 }

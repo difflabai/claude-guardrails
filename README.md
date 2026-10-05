@@ -185,6 +185,13 @@ dynamic, malformed or unsupported code gets no exemption and the remote-pipe
 rule blocks it. Existing checks on environment prefixes, interpreter flags,
 shell literals, expansions and arguments still apply.
 
+The whole command must be free of variable assignments and export-like builtins,
+apart from the Python stage's own checked harmless prefixes (such as `LC_ALL=C`).
+Any `PYTHON*` token or uncertain shell argument prevents the exemption. Environment
+inherited from **outside the command**, such as `PYTHONWARNINGS` or `PYTHONSTARTUP`
+set in the user's real shell profile, is not visible to this hook; the allowlist
+cannot defend against it.
+
 Double-quoted shell words are decoded using bash's backslash rules before the
 Python allowlist runs. CR, NUL and form feed are rejected anywhere in the code;
 tabs remain supported. Uncertain shell word kinds get no exemption.
