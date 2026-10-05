@@ -188,13 +188,43 @@ shell literals, expansions and arguments still apply.
 The **entire command must parse as a single pipeline of plain simple commands**.
 Lists (`;`, `&`, `&&`, `||`), additional statements, functions, subshells, brace
 groups, compound commands, negation, heredocs and here-strings get no exemption.
-Every command name must be literal. Stages that evaluate shell text or change
-shell state (`eval`, `source`, `.`, `cd`, `pushd`, `popd`, `export`, `declare`,
-`typeset`, `readonly`, `set`, `alias`, `trap`, `exec`, `command`, `builtin`) are
-excluded, as are `env` assignments or split-string options. Literal file
-redirections are supported. Variable assignments are excluded apart from the
-Python stage's own checked harmless prefixes (such as `LC_ALL=C`). The existing
-`PYTHON*` token and uncertain-argument checks remain as defence in depth.
+Every command name must be a plain literal word. Every stage other than the
+checked Python stage must belong to the following **closed allowlist**; unknown
+commands or flags disqualify the whole exemption. Non-Python command paths and
+quoted command names are excluded, including quoted names of allowed commands.
+Existing Python interpreter paths remain supported.
+
+| Stage | Allowed flags and operands |
+| --- | --- |
+| `curl` | `-s -S -f -L -4 -6 --compressed`; `-H HEADER -A AGENT -m SECONDS --max-time SECONDS --connect-timeout SECONDS --retry N`; HTTP(S) URL operands |
+| `wget` | `-q -S -4 -6 --quiet --server-response`; `-T SECONDS -t N --timeout SECONDS --tries N --header HEADER --user-agent AGENT`; HTTP(S) URL operands; **requires** the exact stdout-only option `-qO-` or `-O-` |
+| `jq` | `-r -c -e -s` and exactly one literal filter |
+| `cat` | No flags or operands; reads stdin |
+| `head`, `tail` | `-n N`; reads stdin |
+| `grep` | `-E -F -i -v -o -m N` and exactly one literal pattern |
+| `cut` | `-d DELIMITER -f FIELDS`; reads stdin |
+| `tr` | No flags; exactly two literal set operands |
+| `sort` | `-u -r -n`; reads stdin |
+| `uniq` | `-c`; reads stdin |
+| `wc` | `-l -c -w`; reads stdin |
+| `nc` | No flags; exactly a host and a numeric port (1–65535) |
+| `echo` | No flags; literal words that do not start with `-` |
+
+For these data stages, short flags without operands can be combined (such as
+`curl -sSL`, `curl -fsSL` or `jq -rc`). Flags with operands require a separate literal word; attached
+values, long-option abbreviations, `--flag=value`, and `--` are excluded, apart
+from the exact wget stdout options above. Counts are nonnegative decimal
+integers; timeouts are finite nonnegative numbers. Header, agent, delimiter and
+field operands must be nonempty and cannot start with `-` or `@`. Filters accept
+no file operands. Wget without a stdout option is excluded because its default
+behavior writes downloaded files.
+
+File-writing redirections on **any stage**, including Python and stages after
+it, disqualify the exemption (`>`, `>>`, `&>`, `>|`, `<>`, and other unlisted
+forms). Only `2>/dev/null`, `2>&1` and `>&2` are supported. Variable assignments
+are excluded apart from the Python stage's own checked harmless prefixes (such
+as `LC_ALL=C`). The existing `PYTHON*` token and uncertain-argument checks remain
+as defence in depth.
 
 Modules already in the working directory (such as a planted `json.py`) and the
 environment inherited from **outside the command** (such as `PYTHONWARNINGS` or

