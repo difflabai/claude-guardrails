@@ -185,12 +185,21 @@ dynamic, malformed or unsupported code gets no exemption and the remote-pipe
 rule blocks it. Existing checks on environment prefixes, interpreter flags,
 shell literals, expansions and arguments still apply.
 
-The whole command must be free of variable assignments and export-like builtins,
-apart from the Python stage's own checked harmless prefixes (such as `LC_ALL=C`).
-Any `PYTHON*` token or uncertain shell argument prevents the exemption. Environment
-inherited from **outside the command**, such as `PYTHONWARNINGS` or `PYTHONSTARTUP`
-set in the user's real shell profile, is not visible to this hook; the allowlist
-cannot defend against it.
+The **entire command must parse as a single pipeline of plain simple commands**.
+Lists (`;`, `&`, `&&`, `||`), additional statements, functions, subshells, brace
+groups, compound commands, negation, heredocs and here-strings get no exemption.
+Every command name must be literal. Stages that evaluate shell text or change
+shell state (`eval`, `source`, `.`, `cd`, `pushd`, `popd`, `export`, `declare`,
+`typeset`, `readonly`, `set`, `alias`, `trap`, `exec`, `command`, `builtin`) are
+excluded, as are `env` assignments or split-string options. Literal file
+redirections are supported. Variable assignments are excluded apart from the
+Python stage's own checked harmless prefixes (such as `LC_ALL=C`). The existing
+`PYTHON*` token and uncertain-argument checks remain as defence in depth.
+
+Modules already in the working directory (such as a planted `json.py`) and the
+environment inherited from **outside the command** (such as `PYTHONWARNINGS` or
+`PYTHONSTARTUP` set in the user's shell profile) are not visible to this hook;
+the allowlist cannot defend against them.
 
 Double-quoted shell words are decoded using bash's backslash rules before the
 Python allowlist runs. CR, NUL and form feed are rejected anywhere in the code;
