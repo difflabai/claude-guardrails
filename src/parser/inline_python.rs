@@ -193,6 +193,9 @@ fn lex(code: &str) -> Option<Vec<Token<'_>>> {
     let mut brackets = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
+        if tokens.len() > 4096 {
+            return None;
+        }
         let start = i;
         let mut raw = false;
         let mut byte_string = false;

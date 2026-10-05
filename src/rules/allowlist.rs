@@ -29,6 +29,7 @@ pub struct AllowlistConfig {
 }
 
 /// Compiled allowlist for efficient matching
+#[derive(Clone)]
 pub struct CompiledAllowlist {
     /// General patterns (apply to all tools)
     general: Vec<(Regex, String)>,

@@ -21,227 +21,229 @@ pub const DEFAULT_WRAPPERS: &[&str] = &[
     "doas",       // BSD sudo alternative
 ];
 
-/// Extract the actual command from wrapper commands
-///
-/// Example: "sudo timeout 30 rm -rf /" -> ["rm -rf /"]
-/// Example: "env VAR=val command arg" -> ["command arg"]
-pub fn unwrap_command(command: &str, wrappers: &[String]) -> Vec<String> {
-    let wrapper_set: HashSet<&str> = wrappers.iter().map(|s| s.as_str()).collect();
-    let mut results = Vec::new();
+/// Maximum number of nested executable wrappers.
+pub(crate) const MAX_WRAPPER_DEPTH: usize = 128;
 
-    // Tokenize the command
-    let tokens = match shlex::split(command) {
-        Some(t) => t,
-        None => return vec![command.to_string()],
+/// Extract the actual command without recursion or copying each suffix.
+pub fn unwrap_command(command: &str, wrappers: &[String]) -> Result<Vec<String>, &'static str> {
+    let wrapper_set: HashSet<&str> = wrappers.iter().map(String::as_str).collect();
+    let Some(tokens) = shlex::split(command) else {
+        return Ok(vec![command.to_string()]);
     };
-
-    if tokens.is_empty() {
-        return vec![command.to_string()];
-    }
-
-    // Recursively unwrap
-    let unwrapped = unwrap_tokens(&tokens, &wrapper_set);
-
-    if unwrapped.is_empty() {
-        results.push(command.to_string());
-    } else {
-        for cmd_tokens in unwrapped {
-            results.push(cmd_tokens.join(" "));
-        }
-    }
-
-    results
-}
-
-/// Recursively unwrap tokens
-fn unwrap_tokens(tokens: &[String], wrappers: &HashSet<&str>) -> Vec<Vec<String>> {
-    if tokens.is_empty() {
-        return Vec::new();
-    }
-
-    let first = &tokens[0];
-
-    // If not a wrapper, return as-is
-    if !wrappers.contains(first.as_str()) {
-        return vec![tokens.to_vec()];
-    }
-
-    // Handle specific wrappers
-    match first.as_str() {
-        "sudo" => unwrap_sudo(tokens, wrappers),
-        "timeout" => unwrap_timeout(tokens, wrappers),
-        "env" => unwrap_env(tokens, wrappers),
-        "nice" | "ionice" | "nohup" | "strace" | "time" | "unbuffer" => {
-            unwrap_simple_prefix(tokens, wrappers)
-        }
-        "xargs" => unwrap_xargs(tokens, wrappers),
-        "watch" => unwrap_watch(tokens, wrappers),
-        "caffeinate" | "doas" => unwrap_simple_prefix(tokens, wrappers),
-        _ => vec![tokens.to_vec()],
-    }
-}
-
-/// Unwrap sudo command
-/// sudo [-u user] [-g group] [-E] [-H] [-P] [-S] command args...
-fn unwrap_sudo(tokens: &[String], wrappers: &HashSet<&str>) -> Vec<Vec<String>> {
-    let mut idx = 1;
-
-    while idx < tokens.len() {
-        let token = &tokens[idx];
-
-        // Skip sudo options
-        if token.starts_with('-') {
-            // Options that take an argument
-            if matches!(
-                token.as_str(),
-                "-u" | "--user" | "-g" | "--group" | "-C" | "--close-from" | "-h" | "--host"
-            ) {
-                idx += 2; // Skip option and its argument
-            } else {
-                idx += 1; // Skip single option
-            }
-        } else {
-            // Found the actual command
-            let remaining: Vec<String> = tokens[idx..].to_vec();
-            return unwrap_tokens(&remaining, wrappers);
-        }
-    }
-
-    Vec::new()
-}
-
-/// Unwrap timeout command
-/// timeout [options] duration command args...
-fn unwrap_timeout(tokens: &[String], wrappers: &HashSet<&str>) -> Vec<Vec<String>> {
-    let mut idx = 1;
-
-    while idx < tokens.len() {
-        let token = &tokens[idx];
-
-        if token.starts_with('-') {
-            // Options that take an argument
-            if matches!(token.as_str(), "-s" | "--signal" | "-k" | "--kill-after") {
-                idx += 2;
-            } else {
-                idx += 1;
-            }
-        } else {
-            // First non-option is the duration, skip it
-            idx += 1;
-            if idx < tokens.len() {
-                let remaining: Vec<String> = tokens[idx..].to_vec();
-                return unwrap_tokens(&remaining, wrappers);
-            }
+    let tokens: Vec<_> = tokens.into_iter().map(Some).collect();
+    let mut start = 0;
+    let mut depth = 0;
+    while let Some(Some(name)) = tokens.get(start) {
+        if !wrapper_set.contains(name.as_str()) {
             break;
         }
-    }
-
-    Vec::new()
-}
-
-/// Unwrap env command
-/// env [VAR=val...] command args...
-fn unwrap_env(tokens: &[String], wrappers: &HashSet<&str>) -> Vec<Vec<String>> {
-    let mut idx = 1;
-
-    while idx < tokens.len() {
-        let token = &tokens[idx];
-
-        if token.starts_with('-') {
-            // Skip options
-            if matches!(token.as_str(), "-u" | "--unset") {
-                idx += 2;
-            } else {
-                idx += 1;
-            }
-        } else if token.contains('=') {
-            // Skip VAR=val assignments
-            idx += 1;
-        } else {
-            // Found the actual command
-            let remaining: Vec<String> = tokens[idx..].to_vec();
-            return unwrap_tokens(&remaining, wrappers);
+        depth += 1;
+        if depth > MAX_WRAPPER_DEPTH {
+            return Err("wrapper depth");
+        }
+        // The regex backstop keeps uncertain syntax intact. Pipeline policy
+        // separately treats unknown wrapper options/names as possible code.
+        match wrapped_command_index(name, &tokens[start + 1..]) {
+            Ok(Some(index)) => start += index + 1,
+            _ => break,
         }
     }
-
-    Vec::new()
+    if start == 0 || start >= tokens.len() {
+        Ok(vec![command.to_string()])
+    } else {
+        Ok(vec![tokens[start..]
+            .iter()
+            .map(|t| t.as_deref().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join(" ")])
+    }
 }
 
-/// Unwrap simple prefix commands (nice, nohup, etc.)
-/// These just take optional flags then the command
-fn unwrap_simple_prefix(tokens: &[String], wrappers: &HashSet<&str>) -> Vec<Vec<String>> {
-    let mut idx = 1;
-
-    while idx < tokens.len() {
-        let token = &tokens[idx];
-
-        if token.starts_with('-') {
-            // nice -n N, ionice -c N, etc.
-            if matches!(token.as_str(), "-n" | "-c" | "-p") {
-                idx += 2;
-            } else {
-                idx += 1;
+/// Locate just the wrapped executable. Option operands are data, never commands.
+/// None tokens are undecodable shell words. Unknown syntax fails closed.
+/// env split-string reparses argv and is deliberately always uncertain.
+pub(crate) fn wrapped_command_index(
+    wrapper: &str,
+    args: &[Option<String>],
+) -> Result<Option<usize>, &'static str> {
+    let base = wrapper.rsplit('/').next().unwrap_or(wrapper);
+    let (no_value, with_value): (&[&str], &[&str]) = match base {
+        "env" => (
+            &["i", "ignore-environment", "0", "null", "v", "debug"],
+            &["u", "unset", "C", "chdir"],
+        ),
+        "xargs" => (
+            &[
+                "0",
+                "null",
+                "r",
+                "no-run-if-empty",
+                "t",
+                "verbose",
+                "p",
+                "interactive",
+                "x",
+                "exit",
+            ],
+            &[
+                "n",
+                "max-args",
+                "L",
+                "max-lines",
+                "I",
+                "replace",
+                "E",
+                "eof",
+                "s",
+                "max-chars",
+                "P",
+                "max-procs",
+                "d",
+                "delimiter",
+                "a",
+                "arg-file",
+            ],
+        ),
+        "sudo" | "doas" => (
+            &[
+                "E",
+                "H",
+                "P",
+                "S",
+                "n",
+                "b",
+                "k",
+                "K",
+                "preserve-env",
+                "non-interactive",
+            ],
+            &[
+                "u",
+                "user",
+                "g",
+                "group",
+                "C",
+                "close-from",
+                "h",
+                "host",
+                "p",
+                "prompt",
+            ],
+        ),
+        "timeout" => (
+            &["foreground", "preserve-status", "v", "verbose"],
+            &["s", "signal", "k", "kill-after"],
+        ),
+        "nice" => (&[], &["n", "adjustment"]),
+        "ionice" => (
+            &["t", "ignore"],
+            &[
+                "c",
+                "class",
+                "n",
+                "classdata",
+                "p",
+                "pid",
+                "P",
+                "pgid",
+                "u",
+                "uid",
+            ],
+        ),
+        "strace" => (
+            &[
+                "f", "ff", "t", "tt", "T", "q", "qq", "v", "x", "xx", "y", "yy",
+            ],
+            &["o", "output", "e", "s", "p", "u"],
+        ),
+        "time" => (
+            &["p", "v", "verbose", "a", "append"],
+            &["o", "output", "f", "format"],
+        ),
+        "watch" => (
+            &[
+                "x",
+                "exec",
+                "t",
+                "no-title",
+                "d",
+                "differences",
+                "g",
+                "chgexit",
+                "e",
+                "errexit",
+                "b",
+                "beep",
+                "c",
+                "color",
+                "p",
+                "precise",
+            ],
+            &["n", "interval"],
+        ),
+        "caffeinate" => (&["d", "i", "m", "s", "u"], &["t", "w"]),
+        "nohup" | "unbuffer" => (&[], &[]),
+        _ => return Err("unknown wrapper"),
+    };
+    let mut i = 0;
+    while i < args.len() {
+        let value = args[i].as_deref().ok_or("dynamic wrapper argument")?;
+        if value == "--" {
+            i += 1;
+            break;
+        }
+        if base == "env" && value.contains('=') && !value.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        if !value.starts_with('-') || value == "-" {
+            break;
+        }
+        if let Some(long) = value.strip_prefix("--") {
+            let (flag, attached) = long
+                .split_once('=')
+                .map_or((long, false), |(f, _)| (f, true));
+            if with_value.contains(&flag) {
+                if !attached {
+                    i += 1;
+                    if i >= args.len() {
+                        return Err("missing option operand");
+                    }
+                }
+            } else if !no_value.contains(&flag) || attached {
+                return Err("unknown wrapper option");
             }
         } else {
-            let remaining: Vec<String> = tokens[idx..].to_vec();
-            return unwrap_tokens(&remaining, wrappers);
-        }
-    }
-
-    Vec::new()
-}
-
-/// Unwrap xargs command
-/// xargs [options] [command [initial-args]]
-fn unwrap_xargs(tokens: &[String], wrappers: &HashSet<&str>) -> Vec<Vec<String>> {
-    let mut idx = 1;
-
-    while idx < tokens.len() {
-        let token = &tokens[idx];
-
-        if token.starts_with('-') {
-            // Options that take an argument
-            if matches!(
-                token.as_str(),
-                "-n" | "-L" | "-I" | "-E" | "-s" | "-P" | "-d" | "-a"
-            ) {
-                idx += 2;
-            } else {
-                idx += 1;
+            let flags = value[1..].char_indices();
+            for (offset, ch) in flags {
+                let flag = ch.to_string();
+                if with_value.contains(&flag.as_str()) {
+                    if offset + ch.len_utf8() == value.len() - 1 {
+                        i += 1;
+                        if i >= args.len() {
+                            return Err("missing option operand");
+                        }
+                    }
+                    break;
+                }
+                if !no_value.contains(&flag.as_str()) {
+                    return Err("unknown wrapper option");
+                }
             }
-        } else {
-            // Found the command xargs will execute
-            let remaining: Vec<String> = tokens[idx..].to_vec();
-            return unwrap_tokens(&remaining, wrappers);
         }
+        i += 1;
     }
-
-    Vec::new()
-}
-
-/// Unwrap watch command
-/// watch [options] command
-fn unwrap_watch(tokens: &[String], wrappers: &HashSet<&str>) -> Vec<Vec<String>> {
-    let mut idx = 1;
-
-    while idx < tokens.len() {
-        let token = &tokens[idx];
-
-        if token.starts_with('-') {
-            // Options that take an argument
-            if matches!(token.as_str(), "-n" | "-d" | "--interval" | "--differences") {
-                idx += 2;
-            } else {
-                idx += 1;
-            }
-        } else {
-            // Found the command
-            let remaining: Vec<String> = tokens[idx..].to_vec();
-            return unwrap_tokens(&remaining, wrappers);
+    if base == "timeout" {
+        // The duration is an operand, not the executable.
+        if i >= args.len() || args[i].is_none() {
+            return Err("missing duration");
         }
+        i += 1;
     }
-
-    Vec::new()
+    if base == "timeout" && i >= args.len() {
+        return Err("missing executable");
+    }
+    Ok((i < args.len()).then_some(i))
 }
 
 #[cfg(test)]
@@ -256,13 +258,13 @@ mod tests {
     fn test_unwrap_sudo() {
         let wrappers = default_wrappers();
 
-        let result = unwrap_command("sudo rm -rf /", &wrappers);
+        let result = unwrap_command("sudo rm -rf /", &wrappers).unwrap();
         assert_eq!(result, vec!["rm -rf /"]);
 
-        let result = unwrap_command("sudo -u root rm -rf /", &wrappers);
+        let result = unwrap_command("sudo -u root rm -rf /", &wrappers).unwrap();
         assert_eq!(result, vec!["rm -rf /"]);
 
-        let result = unwrap_command("sudo -E -H ls -la", &wrappers);
+        let result = unwrap_command("sudo -E -H ls -la", &wrappers).unwrap();
         assert_eq!(result, vec!["ls -la"]);
     }
 
@@ -270,10 +272,10 @@ mod tests {
     fn test_unwrap_timeout() {
         let wrappers = default_wrappers();
 
-        let result = unwrap_command("timeout 30 rm -rf /", &wrappers);
+        let result = unwrap_command("timeout 30 rm -rf /", &wrappers).unwrap();
         assert_eq!(result, vec!["rm -rf /"]);
 
-        let result = unwrap_command("timeout -s KILL 60 command arg", &wrappers);
+        let result = unwrap_command("timeout -s KILL 60 command arg", &wrappers).unwrap();
         assert_eq!(result, vec!["command arg"]);
     }
 
@@ -281,10 +283,10 @@ mod tests {
     fn test_unwrap_env() {
         let wrappers = default_wrappers();
 
-        let result = unwrap_command("env VAR=val command arg", &wrappers);
+        let result = unwrap_command("env VAR=val command arg", &wrappers).unwrap();
         assert_eq!(result, vec!["command arg"]);
 
-        let result = unwrap_command("env -i PATH=/bin command", &wrappers);
+        let result = unwrap_command("env -i PATH=/bin command", &wrappers).unwrap();
         assert_eq!(result, vec!["command"]);
     }
 
@@ -292,10 +294,10 @@ mod tests {
     fn test_unwrap_nested() {
         let wrappers = default_wrappers();
 
-        let result = unwrap_command("sudo timeout 30 rm -rf /", &wrappers);
+        let result = unwrap_command("sudo timeout 30 rm -rf /", &wrappers).unwrap();
         assert_eq!(result, vec!["rm -rf /"]);
 
-        let result = unwrap_command("sudo nice -n 10 nohup command arg", &wrappers);
+        let result = unwrap_command("sudo nice -n 10 nohup command arg", &wrappers).unwrap();
         assert_eq!(result, vec!["command arg"]);
     }
 
@@ -303,10 +305,10 @@ mod tests {
     fn test_unwrap_no_wrapper() {
         let wrappers = default_wrappers();
 
-        let result = unwrap_command("rm -rf /", &wrappers);
+        let result = unwrap_command("rm -rf /", &wrappers).unwrap();
         assert_eq!(result, vec!["rm -rf /"]);
 
-        let result = unwrap_command("git status", &wrappers);
+        let result = unwrap_command("git status", &wrappers).unwrap();
         assert_eq!(result, vec!["git status"]);
     }
 
@@ -314,7 +316,7 @@ mod tests {
     fn test_unwrap_nohup() {
         let wrappers = default_wrappers();
 
-        let result = unwrap_command("nohup command arg &", &wrappers);
+        let result = unwrap_command("nohup command arg &", &wrappers).unwrap();
         assert_eq!(result, vec!["command arg &"]);
     }
 
@@ -322,10 +324,10 @@ mod tests {
     fn test_unwrap_xargs() {
         let wrappers = default_wrappers();
 
-        let result = unwrap_command("xargs rm -f", &wrappers);
+        let result = unwrap_command("xargs rm -f", &wrappers).unwrap();
         assert_eq!(result, vec!["rm -f"]);
 
-        let result = unwrap_command("xargs -n 1 echo", &wrappers);
+        let result = unwrap_command("xargs -n 1 echo", &wrappers).unwrap();
         assert_eq!(result, vec!["echo"]);
     }
 }

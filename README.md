@@ -245,6 +245,11 @@ Environment inherited from outside the command, such as `SSLKEYLOGFILE`, can mak
 curl append TLS secrets to a file even with `-q`, exposing secrets that permit
 decryption of captured traffic.
 
+Known pre-existing fail-open paths remain: invalid UTF-8 hook input can return
+`{}` with exit status 0 because stdin line decoding fails before JSON parsing.
+An AST parse error falls back to the regex path, which can miss syntax or
+obfuscation that AST analysis would detect. These are outside this fix's scope.
+
 Double-quoted shell words are decoded using bash's backslash rules before the
 Python allowlist runs. CR, NUL and form feed are rejected anywhere in the code;
 tabs remain supported. Uncertain shell word kinds get no exemption.
@@ -306,15 +311,39 @@ semicolon-separated simple statements, conditional expressions, simple one-line
 allowlisted bodies. Walrus targets must be fixed local names. It rejects
 `def`, `class`, indented suites, aliases, unpacking, decorators, backticks,
 backslash continuations outside strings, non-ASCII identifiers and dunder names.
-Python nesting is limited to 64 levels and scripts to 4096 tokens. Shell ASTs
-are analysed on a joined worker thread with a 256 MiB stack and limited to depth
-6,000 and 131,072 nodes. The depth limit budgets 8 KiB per level (over five times
-the largest measured recursive debug frame), leaving over 5× stack margin. A
-command at the node cap took 0.53 s in a local debug build, below the ~2 s analysis
-budget. Exceeding either limit, worker creation failure, or a worker panic is
-explicitly denied as too complex to analyse, without an exemption or regex fallback.
+Python nesting is limited to 64 levels and scripts to 4096 tokens. All Bash
+analysis, including wrapper unwrapping and the regex backstop, runs on a worker
+with a 256 MiB stack. Commands are capped at **1 MiB of UTF-8 command text**
+before parsing, **6,000 AST levels**, **131,072 AST nodes**, and **128 nested
+wrappers**. A **5-second wall-clock deadline** covers the worker's entire
+analysis; the caller uses a timed receive and joins completed workers. On a
+timeout it returns a decision without waiting for the worker, which terminates
+when the hook process exits. Worker creation failure and worker or hook-body
+panics also fail closed.
 
-These analysis bounds do not limit runtime memory or CPU. Large JSON inputs,
+Exceeding any bound returns DENY with rule ID `command-too-complex`, without
+an exemption or regex fallback. This rule is **not overridable with allow-once**.
+Split legitimate commands into smaller invocations.
+
+Pipeline wrappers use per-wrapper option parsing to check the wrapped command
+name; search patterns, printf formats and other arguments after that name are
+data. Unknown options and dynamic or undecodable executable words (including
+globs and escaped pathnames) fail closed in pipelines. All `env -S` /
+`--split-string` forms are also treated as possible interpreters after a
+network fetch. This deliberately rejects some unusual safe invocations.
+
+An interpreter in a pipeline argument's command substitution is treated as
+inheriting pipeline stdin unless its stdin is explicitly detached with
+`< /dev/null` (including `0<`), a literal here-string, a here-document whose
+body has no expansions, or `0<&-`. Redirects are considered in shell order,
+including compound bodies and additional stderr redirects. Other file redirects
+are treated conservatively: even a literal file may be a FIFO or an alias of
+stdin. Descriptor aliases and process substitutions also retain inherited-input
+classification. A literal printf/echo producer clears remote provenance despite
+stdin or stderr redirects; uncertain output descriptor changes remain conservative.
+
+These analysis bounds do not limit the allowed command’s runtime memory or CPU.
+Large JSON inputs,
 large containers, combinatorial operations, and infinite iterators can exhaust
 resources; input-size and execution limits remain the caller's responsibility.
 `itertools.count`, `itertools.cycle`, and `itertools.repeat` are excluded, while

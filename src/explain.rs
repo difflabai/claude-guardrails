@@ -32,10 +32,10 @@ pub struct ExplainTrace {
 
 /// Build a trace for `command` under `config`.
 pub fn trace(command: &str, config: &Config) -> ExplainTrace {
+    let start = Instant::now();
     let analysis = ast::analyze_command(command);
     let engine = SecurityEngine::new(config.clone());
 
-    let start = Instant::now();
     let decision = engine.check_bash(command);
     let micros = start.elapsed().as_micros();
 

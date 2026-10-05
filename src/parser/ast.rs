@@ -112,26 +112,49 @@ pub struct NormalizedCommand {
 
 /// Parse and analyze a bash command using tree-sitter
 pub fn analyze_command(source: &str) -> CommandAnalysis {
-    on_analysis_stack(|| parse_and_analyze_command(source))
+    if source.len() > MAX_COMMAND_BYTES {
+        return too_complex_analysis();
+    }
+    let source = source.to_owned();
+    on_analysis_stack(move || parse_and_analyze_command(&source))
+        .unwrap_or_else(too_complex_analysis)
 }
 
-/// Keep recursive Rust and tree-sitter work off the caller's small stack.
-/// Joining explicitly prevents a worker panic from becoming a regex fallback.
-fn on_analysis_stack<F>(analyze: F) -> CommandAnalysis
+/// Owned worker: a timeout must not scope-join an unfinished thread.
+/// Completed workers are joined; timed-out workers are detached until process exit.
+pub(crate) fn on_analysis_stack<F, T>(analyze: F) -> Option<T>
 where
-    F: FnOnce() -> CommandAnalysis + Send,
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
 {
-    std::thread::scope(|scope| {
-        match std::thread::Builder::new()
-            .name("shell-ast-analysis".into())
-            .stack_size(AST_STACK_SIZE)
-            .spawn_scoped(scope, analyze)
-        {
-            Ok(worker) => worker.join().unwrap_or_else(|_| too_complex_analysis()),
-            Err(_) => too_complex_analysis(),
-        }
-    })
+    on_analysis_stack_with_timeout(analyze, ANALYSIS_TIMEOUT)
 }
+
+fn on_analysis_stack_with_timeout<F, T>(analyze: F, timeout: std::time::Duration) -> Option<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let worker = std::thread::Builder::new()
+        .name("shell-analysis".into())
+        .stack_size(AST_STACK_SIZE)
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(analyze));
+            let _ = sender.send(result);
+        })
+        .ok()?;
+    match receiver.recv_timeout(timeout) {
+        Ok(result) => {
+            worker.join().ok()?;
+            result.ok()
+        }
+        Err(_) => None,
+    }
+}
+
+pub(crate) const MAX_COMMAND_BYTES: usize = 1024 * 1024;
+pub(crate) const ANALYSIS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn too_complex_analysis() -> CommandAnalysis {
     CommandAnalysis {
@@ -148,7 +171,7 @@ fn too_complex_analysis() -> CommandAnalysis {
     }
 }
 
-fn parse_and_analyze_command(source: &str) -> CommandAnalysis {
+pub(crate) fn parse_and_analyze_command(source: &str) -> CommandAnalysis {
     let mut parser = Parser::new();
 
     // Set the bash language
@@ -228,7 +251,7 @@ fn analyze_tree(tree: &Tree, source: &str) -> CommandAnalysis {
     collect_commands(&root, source, &mut commands, &mut has_dynamic_command);
 
     // Check for pipe to shell patterns
-    check_pipeline_flow(&root, source, false, false, &mut flags);
+    check_pipeline_flow(&root, None, source, FlowContext::default(), &mut flags);
 
     CommandAnalysis {
         commands,
@@ -520,38 +543,60 @@ fn strip_quotes(s: &str) -> String {
 /// Classify stdin readers separately from output provenance. Nested pipelines
 /// inherit their first stage's stdin and return their last stage's provenance.
 /// Sibling statements share stdin, never each other's stdout.
-fn check_pipeline_flow(
-    node: &Node,
-    source: &str,
+#[derive(Clone, Copy, Default)]
+struct FlowContext {
     input_remote: bool,
     piped: bool,
+    in_substitution: bool,
+    detached: bool,
+    output_redirected: bool,
+}
+
+/// Parent/context are passed down: Node::parent() searches from the root.
+fn check_pipeline_flow(
+    node: &Node,
+    parent: Option<Node>,
+    source: &str,
+    mut context: FlowContext,
     flags: &mut PipeFlags,
 ) -> bool {
+    if node.kind() == "command_substitution" {
+        context.in_substitution = true;
+        // Expansions run before the enclosing command's redirects.
+        context.detached = false;
+    }
     if node.kind() == "pipeline" {
         let mut cursor = node.walk();
         let stages: Vec<_> = node.named_children(&mut cursor).collect();
-        // tree-sitter hangs a trailing redirect (`a | b < <(c)`) on a
-        // redirected_statement around the whole pipeline; bash applies it to
-        // the last stage, so its commands join that stage.
-        let mut trailing = Vec::new();
-        if let Some(parent) = node.parent() {
-            if parent.kind() == "redirected_statement" {
-                let mut c = parent.walk();
-                for r in parent.named_children(&mut c) {
-                    if r.kind().ends_with("_redirect") {
-                        trailing.push(r);
-                    }
-                }
-            }
-        }
-        let mut upstream_remote = input_remote;
+        let trailing: Vec<_> = parent
+            .filter(|p| p.kind() == "redirected_statement")
+            .map(|p| redirects(&p))
+            .unwrap_or_default();
+        let mut upstream_remote = context.input_remote;
         for (i, stage) in stages.iter().enumerate() {
-            let stage_input = upstream_remote;
-            upstream_remote =
-                check_pipeline_flow(stage, source, stage_input, piped || i > 0, flags);
+            let mut stage_context = FlowContext {
+                input_remote: upstream_remote,
+                piped: context.piped || i > 0,
+                detached: context.detached && i == 0,
+                ..context
+            };
+            if i + 1 == stages.len() {
+                apply_redirects(&trailing, source, &mut stage_context);
+            }
+            upstream_remote = check_pipeline_flow(stage, Some(*node), source, stage_context, flags);
             if i + 1 == stages.len() {
                 for r in &trailing {
-                    check_pipeline_flow(r, source, stage_input, true, flags);
+                    check_pipeline_flow(
+                        r,
+                        parent,
+                        source,
+                        FlowContext {
+                            input_remote: stage_context.input_remote,
+                            piped: true,
+                            ..context
+                        },
+                        flags,
+                    );
                 }
             }
             flags.source_is_remote |= upstream_remote;
@@ -559,172 +604,208 @@ fn check_pipeline_flow(
         return upstream_remote;
     }
 
+    let mut body_context = context;
+    apply_redirects(&redirects(node), source, &mut body_context);
     let mut output_remote = false;
     if node.kind() == "command" {
-        if let Some(cmd) = extract_command(node, source) {
-            if piped && !substitution_has_independent_stdin(node, source) {
+        // Flow needs a name, not repeated copies of overlapping command text.
+        if let Some(name_node) = node.child_by_field_name("name") {
+            let (name, _) = normalize_command_name(&name_node, source);
+            let wrapped = resolve_pipeline_command(node, source, &name);
+            if body_context.piped && !body_context.detached {
+                // Unknown executable/options could wrap a shell even with
+                // local input. Remote input uses the dedicated RCE rule.
+                if wrapped.is_err() && !body_context.input_remote {
+                    flags.pipe_to_shell = true;
+                }
                 check_command_for_interpreters(
-                    &cmd,
+                    &name,
+                    &wrapped,
                     &mut flags.pipe_to_shell,
                     &mut flags.pipe_to_interpreter,
                 );
                 let runs = runs_stdin_as_code(
                     node,
                     source,
+                    &name,
+                    &wrapped,
                     flags.inline_candidate == Some(node.id()),
                     &mut flags.inline_script_ranges,
                 );
-                flags.remote_source_to_interpreter |= input_remote && runs;
+                flags.remote_source_to_interpreter |= body_context.input_remote && runs;
             }
-            // Most commands may forward/transform stdin. Only known producers
-            // replace it; notably `nc | (printf x | python3)` stays exempt.
-            let replaces_input = input_remote
-                && matches!(cmd.name.rsplit('/').next().unwrap_or(""), "printf" | "echo")
+            let replaces_input = body_context.input_remote
+                && matches!(name.rsplit('/').next().unwrap_or(""), "printf" | "echo")
+                && !body_context.output_redirected
                 && command_arguments_are_plain_literals(node, source);
-            output_remote = command_is_remote_fetcher(&cmd) || (input_remote && !replaces_input);
+            let fetches = REMOTE_FETCHERS.contains(name.rsplit('/').next().unwrap_or(""))
+                || wrapped
+                    .as_ref()
+                    .ok()
+                    .and_then(|n| n.as_deref())
+                    .is_some_and(|n| REMOTE_FETCHERS.contains(n.rsplit('/').next().unwrap_or("")));
+            output_remote = fetches || (body_context.input_remote && !replaces_input);
         }
     }
-    // Subshells, groups, substitutions and redirects inherit this stdin.
-    // Union sibling outputs because any of them can contribute remote bytes.
+    let pipeline_body = node.kind() == "redirected_statement"
+        && node
+            .child_by_field_name("body")
+            .is_some_and(|b| b.kind() == "pipeline");
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        // Pipeline traversal already visits its parent's trailing redirects with
-        // the last stage's input. Do not visit those subtrees a second time.
-        if node.kind() == "redirected_statement"
-            && node
-                .child_by_field_name("body")
-                .is_some_and(|body| body.kind() == "pipeline")
-            && child.kind().ends_with("_redirect")
-        {
-            continue;
+        let is_redirect = child.kind().ends_with("_redirect");
+        if pipeline_body && is_redirect {
+            continue; // Already visited with the final stage's input.
         }
-        output_remote |= check_pipeline_flow(&child, source, input_remote, piped, flags);
+        // Redirect destination expansions inherit the original stdin, not the
+        // descriptor changes applied to the command/compound body.
+        let child_context = if is_redirect || pipeline_body {
+            context
+        } else {
+            body_context
+        };
+        output_remote |= check_pipeline_flow(&child, Some(*node), source, child_context, flags);
     }
     output_remote
 }
 
-/// Only the immediate command in an argument substitution can replace its
-/// inherited pipe input. Redirect expansions themselves still inherit the pipe
-/// and are visited normally. Preserve pipe classification for stdin aliases and
-/// uncertain destinations/expanded here-documents.
-fn substitution_has_independent_stdin(node: &Node, source: &str) -> bool {
-    let Some(parent) = node.parent() else {
-        return false;
-    };
-    let holder = if parent.kind() == "command_substitution" {
-        *node
-    } else if parent.kind() == "redirected_statement"
-        && parent.child_by_field_name("body") == Some(*node)
-        && parent
-            .parent()
-            .is_some_and(|p| p.kind() == "command_substitution")
-    {
-        parent
-    } else {
-        return false;
-    };
-    let mut cursor = holder.walk();
-    let redirects: Vec<_> = holder
-        .named_children(&mut cursor)
+fn redirects<'tree>(node: &Node<'tree>) -> Vec<Node<'tree>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
         .filter(|child| child.kind().ends_with("_redirect"))
-        .collect();
-    // Multiple redirects and explicit descriptors need ordered descriptor
-    // resolution. Retain the conservative denial for those uncertain forms.
-    if redirects.len() != 1 {
-        return false;
-    }
-    let independent = redirects.into_iter().any(|redirect| {
-        if redirect.start_byte() > 0
-            && source.as_bytes()[redirect.start_byte() - 1].is_ascii_digit()
-        {
-            return false;
-        }
-        if contains_kind(&redirect, DYNAMIC_KINDS) {
-            return false;
-        }
-        match redirect.kind() {
-            "herestring_redirect" | "heredoc_redirect" => true,
-            "file_redirect" => {
-                let text = redirect.utf8_text(source.as_bytes()).unwrap_or("");
-                if !text.starts_with('<') || text.starts_with("<&") {
-                    return false;
-                }
-                redirect
-                    .child_by_field_name("destination")
-                    .and_then(|destination| decode_literal_word(&destination, source))
-                    .is_some_and(|path| {
-                        !path.is_empty()
-                            && (!path.starts_with("/dev/") || path == "/dev/null")
-                            && !path.starts_with("/proc/")
-                    })
-            }
-            _ => false,
-        }
-    });
-    independent
+        .collect()
 }
 
-/// Producers clear provenance only when no expansion, substitution or redirect
-/// could read stdin (including Bash's commandless `$(< /dev/stdin)`).
-fn command_arguments_are_plain_literals(node: &Node, source: &str) -> bool {
-    if node
-        .parent()
-        .is_some_and(|parent| parent.kind() == "redirected_statement")
-        || node.parent().is_some_and(|parent| {
-            parent.kind() == "pipeline"
-                && parent
-                    .parent()
-                    .is_some_and(|p| p.kind() == "redirected_statement")
-                && parent.named_child(parent.named_child_count() - 1) == Some(*node)
-        })
-    {
-        return false;
+/// Resolve fd 0 in shell order. Only the four explicitly trusted forms detach.
+/// Other file paths, fd aliases and process substitutions stay conservative.
+fn apply_redirects(redirects: &[Node], source: &str, context: &mut FlowContext) {
+    for redirect in redirects {
+        let text = redirect
+            .utf8_text(source.as_bytes())
+            .unwrap_or("")
+            .trim_start();
+        let digits = text.bytes().take_while(u8::is_ascii_digit).count();
+        let operation = &text[digits..];
+        let input = operation.starts_with('<');
+        // tree-sitter's repeated destination field can swallow a following
+        // IO number: `</dev/null 0>&2` becomes `</dev/null 0` then `>&2`.
+        // Recover only a contiguous, unquoted, all-digit token before the op.
+        let before = &source[..redirect.start_byte()];
+        let number_start =
+            before.len() - before.bytes().rev().take_while(u8::is_ascii_digit).count();
+        let swallowed_descriptor = (number_start < before.len()
+            && (number_start == 0 || before.as_bytes()[number_start - 1].is_ascii_whitespace()))
+        .then(|| &before[number_start..]);
+        let descriptor = if let Some(descriptor) = swallowed_descriptor.filter(|_| digits == 0) {
+            descriptor
+        } else if digits == 0 {
+            if input {
+                "0"
+            } else {
+                "1"
+            }
+        } else {
+            &text[..digits]
+        };
+        let descriptor = descriptor.trim_start_matches('0');
+        let descriptor = if descriptor.is_empty() {
+            "0"
+        } else {
+            descriptor
+        };
+        if operation.starts_with('>') && descriptor == "1" || operation.starts_with("&>") {
+            context.output_redirected = true;
+        }
+        if !context.in_substitution || descriptor != "0" {
+            continue;
+        }
+        context.detached = input
+            && !contains_kind(redirect, DYNAMIC_KINDS)
+            && match redirect.kind() {
+                "herestring_redirect" => redirect
+                    .named_child(redirect.named_child_count().saturating_sub(1))
+                    .and_then(|d| decode_literal_word(&d, source))
+                    .is_some(),
+                "heredoc_redirect" => true,
+                "file_redirect" if operation.trim() == "<&-" => true,
+                "file_redirect" if operation.starts_with('<') && !operation.starts_with("<&") => {
+                    redirect
+                        .child_by_field_name("destination")
+                        .and_then(|d| decode_literal_word(&d, source))
+                        .is_some_and(|path| path == "/dev/null")
+                }
+                _ => false,
+            };
     }
+}
+
+/// stdin/stderr redirects do not turn printf/echo's literal argv into pipe data.
+fn command_arguments_are_plain_literals(node: &Node, source: &str) -> bool {
     let mut cursor = node.walk();
     let literal = node.children(&mut cursor).all(|child| {
-        child.kind() == "command_name" || decode_literal_word(&child, source).is_some()
+        child.kind() == "command_name"
+            || child.kind().ends_with("_redirect")
+            || decode_literal_word(&child, source).is_some()
     });
     literal
 }
 
-/// Whether a command is (or wraps, via sudo/env/timeout/…) a remote fetcher.
-/// Checks the command name and, for wrapper commands, every argument — mirroring
-/// the sink-side interpreter check so `sudo wget …`, `env FOO=1 curl …`,
-/// `timeout 30 wget …` all resolve to their real fetcher.
-fn command_is_remote_fetcher(cmd: &NormalizedCommand) -> bool {
-    let base = |s: &str| {
-        s.to_lowercase()
-            .rsplit('/')
-            .next()
-            .unwrap_or("")
-            .to_string()
-    };
-    let name = base(&cmd.name);
-    if REMOTE_FETCHERS.contains(name.as_str()) {
-        return true;
+/// Resolve wrapper executable positions only. Arguments after the executable
+/// are data. An undecodable executable or option may be an interpreter.
+fn resolve_pipeline_command(node: &Node, source: &str, name: &str) -> Result<Option<String>, ()> {
+    if !PIPELINE_WRAPPERS.contains(name.rsplit('/').next().unwrap_or("")) {
+        return Ok(None);
     }
-    if PIPELINE_WRAPPERS.contains(name.as_str()) {
-        // Resolve the wrapped command: the first argument that is not a flag, a
-        // `KEY=VAL` env assignment, or a numeric duration operand (timeout/nice),
-        // then test only THAT token. Scanning every argument would over-fire on a
-        // fetcher word appearing as data (`nice grep http log | ruby`).
-        if let Some(inner) = cmd
-            .arguments
-            .iter()
-            .find(|a| !a.starts_with('-') && !a.contains('=') && !is_duration(a))
-        {
-            return REMOTE_FETCHERS.contains(base(inner).as_str());
+    let mut cursor = node.walk();
+    let arg_nodes: Vec<_> = node
+        .named_children(&mut cursor)
+        .skip_while(|c| c.kind() != "command_name")
+        .skip(1)
+        .filter(|c| !c.kind().ends_with("_redirect"))
+        .collect();
+    let args: Vec<_> = arg_nodes
+        .iter()
+        .enumerate()
+        .map(|(i, arg)| {
+            // tree-sitter can split one Bash argv word at a backslash-newline.
+            // Never accept the apparently literal prefix as the executable.
+            if arg_nodes.get(i + 1).is_some_and(|next| {
+                source[arg.end_byte()..next.start_byte()].contains(
+                    "\\
+",
+                )
+            }) {
+                return None;
+            }
+            decode_literal_word(arg, source).or_else(|| {
+                let text = arg.utf8_text(source.as_bytes()).ok()?;
+                // Replacement markers inside literal options are option data.
+                (matches!(arg.kind(), "word" | "concatenation")
+                    && text.starts_with('-')
+                    && !text.contains('\\')
+                    && !contains_kind(arg, DYNAMIC_KINDS))
+                .then(|| text.to_owned())
+            })
+        })
+        .collect();
+    let mut name = name.to_owned();
+    let mut start = 0;
+    for _ in 0..super::wrapper::MAX_WRAPPER_DEPTH {
+        let index = super::wrapper::wrapped_command_index(&name, &args[start..]).map_err(|_| ())?;
+        let Some(index) = index else {
+            return Ok(None);
+        };
+        start += index;
+        name = args[start].clone().ok_or(())?;
+        if name.chars().any(char::is_whitespace) {
+            return Err(());
+        }
+        start += 1;
+        if !PIPELINE_WRAPPERS.contains(name.rsplit('/').next().unwrap_or("")) {
+            return Ok(Some(name));
         }
     }
-    false
-}
-
-/// Whether a token is a bare numeric duration operand (`30`, `30s`, `5m`, `1h`),
-/// as consumed by `timeout`/`nice` — so it's skipped when resolving the wrapped
-/// command rather than mistaken for it.
-fn is_duration(s: &str) -> bool {
-    let digits = s.trim_end_matches(['s', 'm', 'h', 'd']);
-    !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+    Err(())
 }
 
 /// Interpreter families, for the inline-literal-script exemption.
@@ -765,13 +846,12 @@ fn interpreter_kind(name: &str) -> Option<Interp> {
 fn runs_stdin_as_code(
     node: &Node,
     source: &str,
+    name: &str,
+    wrapped: &Result<Option<String>, ()>,
     inline_candidate: bool,
     inline_ranges: &mut Vec<Range<usize>>,
 ) -> bool {
-    let Some(cmd) = extract_command(node, source) else {
-        return false;
-    };
-    match interpreter_kind(&cmd.name) {
+    match interpreter_kind(name) {
         Some(Interp::Shell) => true,
         Some(kind) => {
             if inline_candidate && is_inline_literal_script(node, source, kind) {
@@ -781,41 +861,12 @@ fn runs_stdin_as_code(
                 true
             }
         }
-        None => {
-            let lower = cmd.name.to_lowercase();
-            let base = lower.rsplit('/').next().unwrap_or("");
-            if !PIPELINE_WRAPPERS.contains(base) {
-                return false;
-            }
-            let mut cursor = node.walk();
-            let runs = node
-                .named_children(&mut cursor)
-                .skip_while(|child| child.kind() != "command_name")
-                .skip(1)
-                .filter(|child| !child.kind().ends_with("_redirect"))
-                .any(|arg| {
-                    // Only env split-string reparses uncertain command text.
-                    // Ordinary wrapper markers/globs/variables are not by
-                    // themselves evidence of an interpreter.
-                    let Some(value) = decode_literal_word(&arg, source) else {
-                        return false;
-                    };
-                    (base == "env" && env_splits_string(&value))
-                        || value
-                            .split_whitespace()
-                            .any(|token| interpreter_kind(token).is_some())
-                });
-            runs
-        }
+        None => match wrapped {
+            Err(()) => true,
+            Ok(Some(name)) => interpreter_kind(name).is_some(),
+            Ok(None) => false,
+        },
     }
-}
-
-/// Split-string options can embed an entire command, including in the option
-/// itself. Treat all such env invocations as code, even for unknown commands.
-fn env_splits_string(arg: &str) -> bool {
-    arg == "--split-string"
-        || arg.starts_with("--split-string=")
-        || (arg.starts_with('-') && !arg.starts_with("--") && arg.contains('S'))
 }
 
 /// Node kinds whose text is not fixed at parse time.
@@ -1403,7 +1454,8 @@ pub fn mask_ranges(command: &str, ranges: &[Range<usize>]) -> String {
 /// Check a command (and its arguments) for shell/script interpreters
 /// This handles wrappers like xargs, env, etc.
 fn check_command_for_interpreters(
-    cmd: &NormalizedCommand,
+    name: &str,
+    wrapped: &Result<Option<String>, ()>,
     has_pipe_to_shell: &mut bool,
     has_pipe_to_interpreter: &mut bool,
 ) {
@@ -1412,15 +1464,11 @@ fn check_command_for_interpreters(
         Some(_) => *has_pipe_to_interpreter = true,
         None => {}
     };
-    classify(&cmd.name);
-    let lower = cmd.name.to_lowercase();
-    let base = lower.rsplit('/').next().unwrap_or("");
-    if PIPELINE_WRAPPERS.contains(base) {
-        for arg in &cmd.arguments {
-            for token in arg.split_whitespace() {
-                classify(token);
-            }
-        }
+    classify(name);
+    if let Ok(Some(name)) = wrapped {
+        classify(name);
+    } else if wrapped.is_err() {
+        *has_pipe_to_interpreter = true;
     }
 }
 
@@ -1444,8 +1492,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_analysis_deadline_does_not_join_stuck_worker() {
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (finished, done) = std::sync::mpsc::channel();
+        let start = std::time::Instant::now();
+        let result = on_analysis_stack_with_timeout(
+            move || {
+                blocked.recv().unwrap();
+                finished.send(()).unwrap();
+                1
+            },
+            std::time::Duration::from_millis(50),
+        );
+        assert!(result.is_none());
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        release.send(()).unwrap();
+        done.recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+    }
+
+    #[test]
     fn test_analysis_worker_panic_fails_closed() {
-        let analysis = on_analysis_stack(|| panic!("simulated AST worker failure"));
+        let analysis = on_analysis_stack(|| panic!("simulated AST worker failure"))
+            .unwrap_or_else(too_complex_analysis);
         assert!(analysis.too_complex);
         assert!(!analysis.parsed);
         assert!(analysis.commands.is_empty());
@@ -1460,12 +1529,17 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(" && ");
             let start = std::time::Instant::now();
-            let analysis = analyze_command(&command);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let _ = tx.send(analyze_command(&command));
+            });
+            let analysis = rx.recv_timeout(std::time::Duration::from_secs(15)).unwrap();
+            worker.join().unwrap();
             let elapsed = start.elapsed();
             assert_eq!(analysis.parsed, allowed);
             assert_eq!(analysis.too_complex, !allowed);
             eprintln!("depth cap boundary: allowed={allowed}, elapsed={elapsed:?}");
-            assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
+            assert!(elapsed < std::time::Duration::from_secs(15), "{elapsed:?}");
         }
     }
 
