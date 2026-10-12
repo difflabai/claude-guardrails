@@ -26,6 +26,15 @@ pub struct HookSpecificOutput {
     /// Permission decision: "allow" or "deny"
     #[serde(rename = "permissionDecision")]
     pub permission_decision: String,
+
+    /// Why the call was denied. On a deny, Claude Code shows this text to the
+    /// model; `systemMessage` goes to the user only. Without it the model sees
+    /// a bare "Blocked by hook" and cannot tell which rule fired.
+    #[serde(
+        rename = "permissionDecisionReason",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub permission_decision_reason: Option<String>,
 }
 
 /// Decision result from the security engine
@@ -105,23 +114,27 @@ impl HookOutput {
 
     /// Create a deny response with reason
     pub fn deny(reason: &str) -> Self {
+        let message = format!("[guardrails] Blocked: {}", reason);
         HookOutput {
             hook_specific_output: Some(HookSpecificOutput {
                 hook_event_name: "PreToolUse".to_string(),
                 permission_decision: "deny".to_string(),
+                permission_decision_reason: Some(message.clone()),
             }),
-            system_message: Some(format!("[guardrails] Blocked: {}", reason)),
+            system_message: Some(message),
         }
     }
 
     /// Create a deny response with rule ID and reason
     pub fn deny_with_rule(rule_id: &str, reason: &str) -> Self {
+        let message = format!("[guardrails:{}] Blocked: {}", rule_id, reason);
         HookOutput {
             hook_specific_output: Some(HookSpecificOutput {
                 hook_event_name: "PreToolUse".to_string(),
                 permission_decision: "deny".to_string(),
+                permission_decision_reason: Some(message.clone()),
             }),
-            system_message: Some(format!("[guardrails:{}] Blocked: {}", rule_id, reason)),
+            system_message: Some(message),
         }
     }
 
@@ -173,6 +186,36 @@ mod tests {
         let json = output.to_json();
         assert!(json.contains("deny"));
         assert!(json.contains("rm-root"));
+    }
+
+    #[test]
+    fn test_deny_reason_reaches_the_model() {
+        let output = HookOutput::deny_with_rule("env-dump", "Dumping all environment variables");
+        let v: serde_json::Value = serde_json::from_str(&output.to_json()).unwrap();
+        let hso = &v["hookSpecificOutput"];
+        assert_eq!(hso["permissionDecision"], "deny");
+        assert_eq!(
+            hso["permissionDecisionReason"],
+            "[guardrails:env-dump] Blocked: Dumping all environment variables"
+        );
+        assert_eq!(v["systemMessage"], hso["permissionDecisionReason"]);
+
+        let plain: serde_json::Value =
+            serde_json::from_str(&HookOutput::deny("Dangerous command").to_json()).unwrap();
+        assert_eq!(
+            plain["hookSpecificOutput"]["permissionDecisionReason"],
+            "[guardrails] Blocked: Dangerous command"
+        );
+    }
+
+    #[test]
+    fn test_allow_and_warn_carry_no_decision_reason() {
+        assert!(!HookOutput::allow()
+            .to_json()
+            .contains("permissionDecisionReason"));
+        assert!(!HookOutput::warn("risky")
+            .to_json()
+            .contains("permissionDecisionReason"));
     }
 
     #[test]
