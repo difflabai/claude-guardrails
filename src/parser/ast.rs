@@ -201,9 +201,7 @@ fn analyze_tree(tree: &Tree, source: &str) -> CommandAnalysis {
     check_pipelines(&root, source, &mut flags);
 
     let mut data_arg_ranges = Vec::new();
-    if !script_can_rewire(&root, source) {
-        collect_data_arg_ranges(&root, source, &mut data_arg_ranges);
-    }
+    collect_data_arg_ranges(&root, source, &mut data_arg_ranges);
 
     CommandAnalysis {
         commands,
@@ -512,6 +510,14 @@ fn push_data_ranges(stmt: &Node, source: &str, out: &mut Vec<Range<usize>>) {
         return;
     }
     let mut cursor = cmd.walk();
+    // no prefix assignments (`FOO=bar fleetmail ...`): not the plain shape
+    if cmd
+        .children(&mut cursor)
+        .any(|c| c.kind() == "variable_assignment")
+    {
+        return;
+    }
+    let mut cursor = cmd.walk();
     for arg in cmd.children(&mut cursor) {
         if matches!(arg.kind(), "string" | "raw_string") {
             if let Ok(text) = arg.utf8_text(source.as_bytes()) {
@@ -535,113 +541,22 @@ fn push_data_ranges(stmt: &Node, source: &str, out: &mut Vec<Range<usize>>) {
     }
 }
 
-/// Builtins that change what a later command word means, or run text from elsewhere.
-const REWIRING_BUILTINS: &[&str] = &[
-    "exec", "coproc", "alias", "unalias", "shopt", "enable", "hash", "trap", "source", ".", "builtin",
-];
-
-/// Variables whose value changes how later commands are found or started.
-fn is_rewiring_variable(name: &str) -> bool {
-    matches!(name, "PATH" | "BASH_ENV" | "ENV" | "IFS") || name.starts_with("BASH_FUNC_")
-}
-
-/// `set` is harmless only for errexit, nounset and pipefail.
-fn is_safe_set(args: &[String]) -> bool {
-    let mut i = 0;
-    if args.is_empty() {
-        return false;
-    }
-    while i < args.len() {
-        let a = args[i].as_str();
-        let Some(flags) = a.strip_prefix('-').or_else(|| a.strip_prefix('+')) else {
-            return false;
-        };
-        if flags.is_empty() || !flags.chars().all(|c| matches!(c, 'e' | 'u' | 'o')) {
-            return false;
-        }
-        if flags.contains('o') {
-            i += 1;
-            match args.get(i).map(String::as_str) {
-                Some("errexit" | "nounset" | "pipefail") => {}
-                _ => return false,
-            }
-        }
-        i += 1;
-    }
-    true
-}
-
-/// True when anything in the script, anywhere, could make a LATER data command run something
-/// else: `exec` redirects, alias/function/coproc/trap/source definitions, PATH-style variables,
-/// `set` options. FAIL CLOSED: such a script gets no mask at all (base behaviour). History
-/// tricks (`fc -ln`) are out of scope and listed in the README.
-fn script_can_rewire(node: &Node, source: &str) -> bool {
-    match node.kind() {
-        "function_definition" | "coproc" => return true,
-        "variable_assignment" => {
-            let name = node
-                .child_by_field_name("name")
-                .and_then(|n| n.utf8_text(source.as_bytes()).ok())
-                .unwrap_or("");
-            if is_rewiring_variable(name) {
-                return true;
-            }
-        }
-        "command" => {
-            let mut cursor = node.walk();
-            let name_node = node
-                .children(&mut cursor)
-                .find(|c| c.kind() == "command_name");
-            if let Some(name_node) = name_node {
-                let (name, _) = normalize_command_name(&name_node, source);
-                let base = name.rsplit('/').next().unwrap_or(&name);
-                if base == "." || REWIRING_BUILTINS.contains(&base) {
-                    return true;
-                }
-                if base == "set" {
-                    let args = extract_command(node, source)
-                        .map(|c| c.arguments)
-                        .unwrap_or_default();
-                    if !is_safe_set(&args) {
-                        return true;
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-    let mut cursor = node.walk();
-    let children: Vec<Node> = node.children(&mut cursor).collect();
-    children.iter().any(|c| script_can_rewire(c, source))
-}
-
 /// Collect the ranges described on `CommandAnalysis::data_arg_ranges`.
 ///
-/// Fail closed: only STATEMENTS AT THE TOP LEVEL of the script are considered (the program, and
-/// the statements of a top-level `&&` / `||` / `;` list). A data command is masked only when
-///   - it has no output redirect of any kind (stdin redirects and heredocs are fine);
-///   - if it is in a pipeline, it is the LAST child of that pipeline, counting every child
-///     whatever its kind (so `echo "…" | (bash)` and `echo "…" | { bash; }` are not masked);
-///   - it is not nested in a subshell, group, function, loop, conditional, coproc, or
-///     substitution: nothing below those nodes is visited.
+/// Fail closed, and small on purpose: the mask applies only when the ENTIRE script is ONE simple
+/// data command (optionally with stdin redirects and heredocs). Anything else (a second
+/// statement, a pipeline, a list, a subshell, a group, a comment, a trailing `&` or `;`) gets no
+/// mask and behaves as the base does. A denylist of "things that could rewire a later command"
+/// cannot be finished (`eval`, `read -r PATH`, `printf -v PATH`, ...); a lone command has no
+/// "later" and no "earlier".
 fn collect_data_arg_ranges(node: &Node, source: &str, out: &mut Vec<Range<usize>>) {
-    match node.kind() {
-        "program" | "list" => {
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                collect_data_arg_ranges(&child, source, out);
-            }
+    if node.kind() != "program" || node.child_count() != 1 {
+        return;
+    }
+    if let Some(only) = node.child(0) {
+        if matches!(only.kind(), "command" | "redirected_statement") {
+            push_data_ranges(&only, source, out);
         }
-        "pipeline" => {
-            let count = node.child_count();
-            if let Some(last) = count.checked_sub(1).and_then(|i| node.child(i)) {
-                if matches!(last.kind(), "command" | "redirected_statement") {
-                    push_data_ranges(&last, source, out);
-                }
-            }
-        }
-        "command" | "redirected_statement" => push_data_ranges(node, source, out),
-        _ => {}
     }
 }
 

@@ -258,25 +258,26 @@ If guardrails blocks a legitimate command, you have three options:
 
 ### Words in data are not commands
 
-The word-matching rules `curl-pipe-python`, `cat-env-file` and `cat-ssh-key` ignore quoted
-arguments and heredoc bodies of a few data-carrying commands (`echo`, `printf`, `fleetmail`,
-`fleet-ring`, `bd`, `gh`), so a mail body that merely mentions `curl | python3` is not blocked.
-The rule is fail-closed: a quoted range is ignored only for the known-safe shape. The command must
-be a top-level statement (not in a subshell, group, function, loop, conditional, coproc or
-substitution), have no output redirect at all (stdin redirects and heredocs are fine), and, in a
-pipeline, be the last child (`echo "..." | bash`, `| (bash)`, `| { bash; }` are never ignored). The
-text must contain no `$(`, backtick or `<(`. `gh` and `bd` count only for `gh pr|issue ...` and
-`bd create|update|comment|close|note`; `gh alias`, `gh extension`, `gh api` and `bd hooks` store or
-run text later and never qualify. Every other command (`bash -c "..."`, `eval`, `ssh host "..."`)
-keeps its quoted text visible. Known false blocks: `echo "... cat .env ..." > notes.txt` and a
-`cat <<EOF` heredoc naming `.env`. Text written to a file and run later is not covered.
+The word-matching rules `curl-pipe-python`, `cat-env-file` and `cat-ssh-key` ignore the quoted
+arguments and heredoc bodies of one kind of command: a LONE data command. A mail body that
+merely mentions `curl | python3` is then not blocked.
 
-A script that could rewire a later command gets no mask at all (all text rules run on the raw
-text): `exec` (any form), `coproc`, `alias`, `unalias`, `shopt`, `enable`, `hash`, `trap`,
-`source` or `.`, `builtin`, a function definition, an assignment to or prefix of `PATH`,
-`BASH_ENV`, `ENV`, `IFS` or `BASH_FUNC_*`, and any `set` other than `-e`, `-u` and `-o
-errexit|nounset|pipefail`. The `gh`/`bd` subcommand must be the word directly after the program
-name, so `gh -R o/r pr comment ...` is not masked. Not covered: shell history tricks (`fc -ln`).
+The mask applies only when the entire script is ONE simple command, and that command is one of
+`fleetmail`, `fleet-ring`, `echo`, `printf`, `gh pr ...` / `gh issue ...` (the subcommand directly
+after `gh`) or `bd create|update|comment|comments|close|note` (directly after `bd`). It has no
+prefix assignment (`FOO=bar fleetmail ...`), no output redirect of any kind (stdin redirects and
+heredocs are fine), and nothing before or after it: no second statement or line, pipeline, list,
+subshell, group, comment or trailing `&`/`;`. The quoted text must contain no `$(`, backtick,
+`<(` or `>(`. Anything else gets no mask and behaves as without this feature.
+
+This is deliberately narrow. A list of "things that could rewire a later command" cannot be
+finished (`eval`, `read -r`, `printf -v`, `alias`, functions, `exec`, `trap`, ...), so a lone
+command, which has no earlier or later statement, is the only shape trusted.
+
+Known false blocks (accepted): `true && echo "... cat .env ..."`, `cd /tmp && fleetmail send ...`,
+`set -e; echo "..."`, `echo "... cat .env ..." > notes.txt`, and any compound command whose
+quoted text names a protected word. Also a `cat <<EOF` heredoc naming `.env`. Not covered: text
+written to a file and run later, and shell history tricks (`fc -ln`).
 
 ## Architecture
 
