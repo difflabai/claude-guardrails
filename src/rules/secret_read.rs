@@ -15,7 +15,7 @@ const READERS: &[&str] = &[
     "cat", "tac", "nl", "less", "more", "most", "head", "tail", "grep", "egrep", "fgrep", "rg",
     "ag", "ack", "awk", "gawk", "mawk", "sed", "cut", "sort", "uniq", "tr", "xxd", "od", "hexdump",
     "strings", "base64", "bat", "batcat", "jq", "yq", "diff", "cmp", "paste", "fold", "fmt",
-    "column", "rev", "cp", "scp", "rsync", "zcat", "open", "pbcopy",
+    "column", "wc", "rev", "cp", "scp", "rsync", "zcat", "open", "pbcopy",
 ];
 
 const SHELLS: &[&str] = &["bash", "sh", "zsh", "dash", "ksh"];
@@ -241,6 +241,19 @@ fn file_operands<'a>(prog: &str, args: &'a [String]) -> Vec<&'a str> {
         "xxd" => (&["-l", "-s", "-c", "-g", "-o"], &[]),
         _ => (&[], &[]),
     };
+    // More flags whose value is a FILE (spaced form). Attached and `=` values are checked for
+    // every program and flag regardless of this list.
+    let extra_file: &[&str] = match prog {
+        "grep" | "egrep" | "fgrep" => &["--exclude-from"],
+        "rg" => &["--ignore-file"],
+        "ag" => &["-p", "--path-to-ignore"],
+        "awk" | "gawk" | "mawk" => &["-i", "--include", "-E"],
+        "diff" => &["--from-file", "--to-file"],
+        "sort" => &["--files0-from", "--random-source"],
+        "wc" => &["--files0-from"],
+        "rsync" | "cp" | "scp" => &["--exclude-from", "--include-from", "--files-from"],
+        _ => &[],
+    };
     let name_value: &[&str] = if matches!(prog, "jq" | "yq") {
         &["--arg", "--argjson"]
     } else {
@@ -288,18 +301,20 @@ fn file_operands<'a>(prog: &str, args: &'a [String]) -> Vec<&'a str> {
             break;
         }
         if a.starts_with('-') && a.len() > 1 {
-            // --opt=value form
+            // --opt=value form: the value is ALWAYS checked, whatever the program and flag.
             if let Some((name, value)) = a.split_once('=') {
+                out.push(value);
                 if name_file.contains(&name) {
-                    // not valid jq, but if a version accepts it, check both the value and the
-                    // next token rather than guess which is the file
-                    out.push(value);
+                    // not valid jq, but if a version accepts it, check the next token too
+                    // rather than guess which is the file
                     if let Some(v) = args.get(i + 1) {
                         out.push(v.as_str());
                     }
-                } else if file_value.contains(&name) {
-                    out.push(value);
-                } else if matches!(name, "-e" | "--regexp" | "--expression") {
+                }
+                if matches!(
+                    name,
+                    "-e" | "--regexp" | "--expression" | "-f" | "--file" | "--from-file"
+                ) {
                     have_pattern_opt = true;
                 }
                 i += 1;
@@ -317,7 +332,7 @@ fn file_operands<'a>(prog: &str, args: &'a [String]) -> Vec<&'a str> {
                 i += 3; // --arg NAME VALUE
                 continue;
             }
-            if file_value.contains(&a) {
+            if file_value.contains(&a) || extra_file.contains(&a) {
                 have_pattern_opt = have_pattern_opt || matches!(a, "-f" | "--file" | "--from-file");
                 if let Some(v) = args.get(i + 1) {
                     out.push(v.as_str());
@@ -331,6 +346,14 @@ fn file_operands<'a>(prog: &str, args: &'a [String]) -> Vec<&'a str> {
                 }
                 i += 2;
                 continue;
+            }
+            // Unlisted flag. A short flag with an attached value (-Xvalue, e.g. sed -f.env) is
+            // checked as a path; a bare flag skips nothing, so the next token stays an operand.
+            if !a.starts_with("--") && a.len() > 2 {
+                out.push(&a[2..]);
+                if a.starts_with("-e") || a.starts_with("-f") {
+                    have_pattern_opt = true; // -ePATTERN / -fFILE supplied the pattern
+                }
             }
             i += 1;
             continue;
@@ -493,6 +516,39 @@ mod tests {
             "sed -e 's/a/b/' .env",
             "jq . secrets.json",
             "jq --arg k v . .env",
+            "sed -f.env x.txt",
+            "grep -eKEY .env",
+            "grep -fpats.txt .env",
+            "sed -escript .env",
+            "sed -f .env x.txt",
+            "sed --file=.env x.txt",
+            "diff --from-file=.env x",
+            "diff --from-file .env x",
+            "diff --to-file=.env x",
+            "sort --files0-from=.env",
+            "sort --files0-from .env",
+            "sort --random-source=.env x",
+            "wc --files0-from=.env",
+            "awk -i .env 1 x",
+            "awk --include .env 1 x",
+            "awk --include=.env 1 x",
+            "awk -f.env x",
+            "grep -f.env KEY",
+            "grep --file=.env KEY README.md",
+            "grep --exclude-from=.env KEY README.md",
+            "grep --exclude-from .env KEY README.md",
+            "grep -ef.env README.md",
+            "rg --ignore-file .env KEY .",
+            "rg --ignore-file=.env KEY .",
+            "ag -p .env KEY",
+            "ag --path-to-ignore .env KEY",
+            "ag -p.env KEY",
+            "rsync --exclude-from=.env . /tmp/b",
+            "rsync --exclude-from .env . /tmp/b",
+            "cp --files-from=.env a b",
+            "head -n5 --foo=~/.ssh/id_rsa",
+            "cat -Xserver.pem",
+            "tail -q.env",
             "jq --rawfile x .env .",
             "jq --slurpfile x secrets.json .",
             "jq --rawfile x ~/.ssh/id_rsa .",
@@ -575,6 +631,27 @@ mod tests {
             "cat README.md",
             "head ~/.ssh/id_rsa.pub",
             "grep credentials README.md",
+            "grep --color=auto KEY README.md",
+            "grep -A 2 KEY README.md",
+            "grep -B2 -A2 KEY README.md",
+            "grep -ePAT README.md",
+            "rg -g '*.rs' KEY",
+            "rg -C 3 KEY src/",
+            "rg -t rust KEY src/",
+            "sort -t= -k2 notes.txt",
+            "sort -o out.txt notes.txt",
+            "sed -i.bak 's/a/b/' notes.txt",
+            "sed -n 1,5p notes.txt",
+            "cut -d= -f1 notes.txt",
+            "xxd -l 16 notes.bin",
+            "od -An -tx1 notes.bin",
+            "jq --arg env prod . data.json",
+            "jq --arg a .env . data.json",
+            "jq --argjson a 1 . data.json",
+            "jq -r .name data.json",
+            "tail -f app.log",
+            "head -c 100 notes.txt",
+            "cut -f1 notes.txt",
             "cat .envrc",
             "ls -la .env",
             "cat notes.txt",
