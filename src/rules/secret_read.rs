@@ -180,9 +180,14 @@ fn segment_reason(seg: &[String], depth: u8) -> Option<&'static str> {
 /// The arguments of reader `prog` that are FILES: option values that are patterns,
 /// scripts, variable names or here-strings are data, not files, and are left out.
 fn file_operands<'a>(prog: &str, args: &'a [String]) -> Vec<&'a str> {
-    // (options whose value is NOT a file, options whose value IS a file)
+    // Options that take a value, by program. RULE: a flag is listed in `skip_value` only when
+    // it certainly takes a NON-file value; skipping a token we should have checked is the
+    // unsafe direction, so any doubt means "not listed" (the token is then treated as an
+    // operand, which can only over-block). `file_value` flags take one FILE value;
+    // `name_file` flags take NAME then FILE (jq --rawfile NAME FILE); `name_value` take NAME
+    // then a non-file VALUE (jq --arg NAME VALUE).
     let (skip_value, file_value): (&[&str], &[&str]) = match prog {
-        "grep" | "egrep" | "fgrep" | "rg" | "ag" | "ack" => (
+        "grep" | "egrep" | "fgrep" => (
             &[
                 "-e",
                 "--regexp",
@@ -195,19 +200,25 @@ fn file_operands<'a>(prog: &str, args: &'a [String]) -> Vec<&'a str> {
                 "--include",
                 "--exclude",
                 "--exclude-dir",
+                "--label",
+                "--binary-files",
+            ],
+            &["-f", "--file"],
+        ),
+        "rg" | "ag" | "ack" => (
+            &[
+                "-e",
+                "--regexp",
+                "-m",
+                "--max-count",
+                "-A",
+                "-B",
+                "-C",
+                "--context",
                 "-g",
                 "--glob",
-                "-t",
-                "-T",
                 "--type",
                 "--type-not",
-                "--color",
-                "--colour",
-                "--label",
-                "-d",
-                "-D",
-                "--binary-files",
-                "-M",
             ],
             &["-f", "--file"],
         ),
@@ -219,19 +230,26 @@ fn file_operands<'a>(prog: &str, args: &'a [String]) -> Vec<&'a str> {
             &["-v", "-F", "--assign", "--field-separator"],
             &["-f", "--file"],
         ),
-        "jq" | "yq" => (
-            &["--arg", "--argjson", "--indent", "-e"],
-            &["-f", "--from-file", "--slurpfile", "--rawfile"],
-        ),
+        // jq: -e is `--exit-status` (NO value). --arg/--argjson are NAME VALUE.
+        "jq" | "yq" => (&["--indent"], &["-f", "--from-file"]),
         "head" | "tail" => (&["-n", "-c", "--lines", "--bytes"], &[]),
         "cut" => (&["-d", "-f", "-c", "-b"], &[]),
-        "tr" | "sort" | "uniq" | "column" | "fold" | "fmt" | "od" | "xxd" | "paste" => (
-            &[
-                "-t", "-k", "-n", "-w", "-s", "-d", "-c", "-l", "-o", "-N", "-j", "-S",
-            ],
-            &[],
-        ),
+        "uniq" => (&["-f", "-s", "-w"], &[]),
+        "paste" => (&["-d"], &[]),
+        "fold" | "fmt" => (&["-w"], &[]),
+        "od" => (&["-N", "-j", "-w", "-A", "-t"], &[]),
+        "xxd" => (&["-l", "-s", "-c", "-g", "-o"], &[]),
         _ => (&[], &[]),
+    };
+    let name_value: &[&str] = if matches!(prog, "jq" | "yq") {
+        &["--arg", "--argjson"]
+    } else {
+        &[]
+    };
+    let name_file: &[&str] = if matches!(prog, "jq" | "yq") {
+        &["--slurpfile", "--rawfile"]
+    } else {
+        &[]
     };
     // grep family, sed and awk take a first POSITIONAL that is the pattern/script/program,
     // unless it was supplied by -e / -f.
@@ -272,12 +290,31 @@ fn file_operands<'a>(prog: &str, args: &'a [String]) -> Vec<&'a str> {
         if a.starts_with('-') && a.len() > 1 {
             // --opt=value form
             if let Some((name, value)) = a.split_once('=') {
-                if file_value.contains(&name) {
+                if name_file.contains(&name) {
+                    // not valid jq, but if a version accepts it, check both the value and the
+                    // next token rather than guess which is the file
+                    out.push(value);
+                    if let Some(v) = args.get(i + 1) {
+                        out.push(v.as_str());
+                    }
+                } else if file_value.contains(&name) {
                     out.push(value);
                 } else if matches!(name, "-e" | "--regexp" | "--expression") {
                     have_pattern_opt = true;
                 }
                 i += 1;
+                continue;
+            }
+            if name_file.contains(&a) {
+                // --rawfile NAME FILE: the FILE is the third token
+                if let Some(v) = args.get(i + 2) {
+                    out.push(v.as_str());
+                }
+                i += 3;
+                continue;
+            }
+            if name_value.contains(&a) {
+                i += 3; // --arg NAME VALUE
                 continue;
             }
             if file_value.contains(&a) {
@@ -292,12 +329,7 @@ fn file_operands<'a>(prog: &str, args: &'a [String]) -> Vec<&'a str> {
                 if matches!(a, "-e" | "--regexp" | "--expression") {
                     have_pattern_opt = true;
                 }
-                // --arg / --argjson take NAME VALUE
-                i += if matches!(a, "--arg" | "--argjson") {
-                    3
-                } else {
-                    2
-                };
+                i += 2;
                 continue;
             }
             i += 1;
@@ -461,6 +493,23 @@ mod tests {
             "sed -e 's/a/b/' .env",
             "jq . secrets.json",
             "jq --arg k v . .env",
+            "jq --rawfile x .env .",
+            "jq --slurpfile x secrets.json .",
+            "jq --rawfile x ~/.ssh/id_rsa .",
+            "jq -e . .env",
+            "jq -n --rawfile k server.pem '$k'",
+            "jq --rawfile=x .env .",
+            "jq . --rawfile x .env",
+            "jq --arg a b --rawfile c .env .",
+            "grep --color KEY .env",
+            "grep -T KEY .env",
+            "rg -t py KEY .env",
+            "sort -s .env",
+            "sort -o /tmp/x .env",
+            "paste -s .env",
+            "tr a b < .env",
+            "uniq -c .env",
+            "column -t .env",
             "cat *.pem",
             "cat .env*",
             "cat prod.env",
