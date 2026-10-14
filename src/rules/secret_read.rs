@@ -180,6 +180,21 @@ fn segment_reason(seg: &[String], depth: u8) -> Option<&'static str> {
 /// The arguments of reader `prog` that are FILES: option values that are patterns,
 /// scripts, variable names or here-strings are data, not files, and are left out.
 fn file_operands<'a>(prog: &str, args: &'a [String]) -> Vec<&'a str> {
+    // tr takes no file operands (its words are character sets); it reads only stdin, so only an
+    // input redirect (`< .env`, `<.env`) can name a file.
+    if prog == "tr" {
+        let mut out = Vec::new();
+        for (i, a) in args.iter().enumerate() {
+            if a == "<" {
+                if let Some(v) = args.get(i + 1) {
+                    out.push(v.as_str());
+                }
+            } else if a.starts_with('<') && !a.starts_with("<<") {
+                out.push(a.as_str());
+            }
+        }
+        return out;
+    }
     // Options that take a value, by program. RULE: a flag is listed in `skip_value` only when
     // it certainly takes a NON-file value; skipping a token we should have checked is the
     // unsafe direction, so any doubt means "not listed" (the token is then treated as an
@@ -227,7 +242,14 @@ fn file_operands<'a>(prog: &str, args: &'a [String]) -> Vec<&'a str> {
             &["-f", "--file"],
         ),
         "awk" | "gawk" | "mawk" => (
-            &["-v", "-F", "--assign", "--field-separator"],
+            &[
+                "-v",
+                "-F",
+                "--assign",
+                "--field-separator",
+                "-e",
+                "--source",
+            ],
             &["-f", "--file"],
         ),
         // jq: -e is `--exit-status` (NO value). --arg/--argjson are NAME VALUE.
@@ -247,13 +269,40 @@ fn file_operands<'a>(prog: &str, args: &'a [String]) -> Vec<&'a str> {
         "grep" | "egrep" | "fgrep" => &["--exclude-from"],
         "rg" => &["--ignore-file"],
         "ag" => &["-p", "--path-to-ignore"],
-        "awk" | "gawk" | "mawk" => &["-i", "--include", "-E"],
+        "awk" | "gawk" | "mawk" => &["-i", "--include", "-E", "--exec"],
         "diff" => &["--from-file", "--to-file"],
         "sort" => &["--files0-from", "--random-source"],
         "wc" => &["--files0-from"],
         "rsync" | "cp" | "scp" => &["--exclude-from", "--include-from", "--files-from"],
         _ => &[],
     };
+    // Flags whose value is a GLOB or a DELIMITER, never a file: attached, `=` and spaced values
+    // are all skipped. `--exclude-from` and friends are NOT here: those values are files.
+    let ignore_value: &[&str] = match prog {
+        "rsync" => &["--exclude", "--include", "--filter"],
+        "grep" | "egrep" | "fgrep" => &["--exclude", "--include", "--exclude-dir"],
+        "diff" => &["-x", "--exclude"],
+        "rg" => &["-g", "--glob", "--iglob", "--type-add"],
+        "ack" => &["--ignore-file", "--ignore-dir"],
+        "cut" | "paste" => &["-d"],
+        "sort" => &["-t", "--field-separator"],
+        "awk" | "gawk" | "mawk" => &["-v", "-F", "--assign", "--field-separator"],
+        _ => &[],
+    };
+    // awk: these flags SUPPLY the program, so the first positional is a file
+    let is_awk = matches!(prog, "awk" | "gawk" | "mawk");
+    let prog_flag = |n: &str| {
+        is_awk
+            && matches!(
+                n,
+                "-f" | "--file" | "-E" | "--exec" | "-e" | "--source" | "-i" | "--include"
+            )
+    };
+    // combined short flags ending in `f` (-if, -vf, -nf): the next token is that flag's FILE
+    let combined_f = matches!(
+        prog,
+        "grep" | "egrep" | "fgrep" | "rg" | "sed" | "awk" | "gawk" | "mawk"
+    );
     let name_value: &[&str] = if matches!(prog, "jq" | "yq") {
         &["--arg", "--argjson"]
     } else {
@@ -303,6 +352,12 @@ fn file_operands<'a>(prog: &str, args: &'a [String]) -> Vec<&'a str> {
         if a.starts_with('-') && a.len() > 1 {
             // --opt=value form: the value is ALWAYS checked, whatever the program and flag.
             if let Some((name, value)) = a.split_once('=') {
+                let short_attached = !name.starts_with("--") && name.len() > 2;
+                let pre = name.get(..2).unwrap_or("");
+                if ignore_value.contains(&name) || (short_attached && ignore_value.contains(&pre)) {
+                    i += 1;
+                    continue;
+                }
                 out.push(value);
                 if name_file.contains(&name) {
                     // not valid jq, but if a version accepts it, check the next token too
@@ -314,10 +369,16 @@ fn file_operands<'a>(prog: &str, args: &'a [String]) -> Vec<&'a str> {
                 if matches!(
                     name,
                     "-e" | "--regexp" | "--expression" | "-f" | "--file" | "--from-file"
-                ) {
+                ) || prog_flag(name)
+                    || (short_attached && prog_flag(pre))
+                {
                     have_pattern_opt = true;
                 }
                 i += 1;
+                continue;
+            }
+            if ignore_value.contains(&a) {
+                i += 2;
                 continue;
             }
             if name_file.contains(&a) {
@@ -333,7 +394,9 @@ fn file_operands<'a>(prog: &str, args: &'a [String]) -> Vec<&'a str> {
                 continue;
             }
             if file_value.contains(&a) || extra_file.contains(&a) {
-                have_pattern_opt = have_pattern_opt || matches!(a, "-f" | "--file" | "--from-file");
+                have_pattern_opt = have_pattern_opt
+                    || matches!(a, "-f" | "--file" | "--from-file")
+                    || prog_flag(a);
                 if let Some(v) = args.get(i + 1) {
                     out.push(v.as_str());
                 }
@@ -341,7 +404,7 @@ fn file_operands<'a>(prog: &str, args: &'a [String]) -> Vec<&'a str> {
                 continue;
             }
             if skip_value.contains(&a) {
-                if matches!(a, "-e" | "--regexp" | "--expression") {
+                if matches!(a, "-e" | "--regexp" | "--expression") || prog_flag(a) {
                     have_pattern_opt = true;
                 }
                 i += 2;
@@ -350,8 +413,24 @@ fn file_operands<'a>(prog: &str, args: &'a [String]) -> Vec<&'a str> {
             // Unlisted flag. A short flag with an attached value (-Xvalue, e.g. sed -f.env) is
             // checked as a path; a bare flag skips nothing, so the next token stays an operand.
             if !a.starts_with("--") && a.len() > 2 {
+                let pre = a.get(..2).unwrap_or("");
+                if ignore_value.contains(&pre) {
+                    i += 1;
+                    continue;
+                }
+                if combined_f
+                    && a.ends_with('f')
+                    && a[1..].chars().all(|c| c.is_ascii_alphabetic())
+                {
+                    have_pattern_opt = true;
+                    if let Some(v) = args.get(i + 1) {
+                        out.push(v.as_str());
+                    }
+                    i += 2;
+                    continue;
+                }
                 out.push(&a[2..]);
-                if a.starts_with("-e") || a.starts_with("-f") {
+                if a.starts_with("-e") || a.starts_with("-f") || prog_flag(pre) {
                     have_pattern_opt = true; // -ePATTERN / -fFILE supplied the pattern
                 }
             }
@@ -600,6 +679,23 @@ mod tests {
             "\\cat .env",
             "/bin/cat .env",
             "bash <<EOF\ncat .env\nEOF",
+            "awk --source=1 .env",
+            "awk -E prog .env",
+            "awk -Eprog .env",
+            "awk -e 1 .env",
+            "awk --source 1 .env",
+            "gawk --exec=p .env",
+            "awk -i inc.awk .env",
+            "awk -f prog.awk .env",
+            "awk -f.env 1",
+            "rsync --exclude-from=.env . /tmp/b",
+            "rsync --include-from=.env . /tmp/b",
+            "grep --exclude-from=.env KEY .",
+            "grep -if .env KEY",
+            "grep -vf .env KEY",
+            "grep -rf .env KEY",
+            "sed -nf .env x.txt",
+            "sed -n -f .env x.txt",
         ] {
             assert!(blocked(c), "should block: {c}");
         }
@@ -655,6 +751,29 @@ mod tests {
             "cat .envrc",
             "ls -la .env",
             "cat notes.txt",
+            "rsync --exclude=.env . /tmp/b",
+            "rsync -av --exclude='.env*' a b",
+            "rsync --exclude .env . /tmp/b",
+            "rsync --filter='- .env' . /tmp/b",
+            "grep -r --exclude=.env KEY .",
+            "grep -r --exclude-dir=.env KEY .",
+            "grep -r --include=.env KEY .",
+            "diff -x .env a b",
+            "diff -x.env a b",
+            "diff --exclude=.env a b",
+            "rg -g.env KEY",
+            "rg --glob=.env KEY",
+            "rg -g .env KEY",
+            "rg --iglob=.env KEY",
+            "rg --type-add=x:.env KEY",
+            "cut -d.env -f1 notes.txt",
+            "awk -vx=.env 1 notes.txt",
+            "awk --assign=x=.env 1 notes.txt",
+            "sort -t.env notes.txt",
+            "paste -d.env a.txt b.txt",
+            "tr a b",
+            "tr -d .env",
+            "tr a-z A-Z < notes.txt",
         ] {
             assert!(!blocked(c), "should pass: {c}");
         }
