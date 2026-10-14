@@ -256,6 +256,16 @@ If guardrails blocks a legitimate command, you have three options:
 2. **Lower the safety level** — Switch from `strict` to `high` or `critical`
 3. **Audit mode** — Run with `GUARDRAILS_WARN_ONLY=1` to see what would be blocked without enforcement
 
+### Words in data are not commands
+
+The word-matching rules `curl-pipe-python`, `cat-env-file` and `cat-ssh-key` ignore quoted
+arguments and heredoc bodies of a few data-carrying commands (`echo`, `printf`, `fleetmail`,
+`fleet-ring`, `bd`, `gh`), so a mail body that merely mentions `curl | python3` is not blocked.
+Nothing is ignored when the text contains `$(`, a backtick or `<(`, when the command's output is
+piped into anything (`echo "..." | bash`), when the command sits inside a substitution, or for any
+other command (`bash -c "..."`, `eval`, `ssh host "..."`). Text written to a file and run later
+(`printf ... > x.sh && bash x.sh`) is not covered.
+
 ## Architecture
 
 ```
