@@ -5,6 +5,7 @@
 
 use once_cell::sync::Lazy;
 use std::collections::HashSet;
+use std::ops::Range;
 use tree_sitter::{Node, Parser, Tree};
 
 /// Shell interpreters that are dangerous when used as pipe targets
@@ -101,6 +102,12 @@ pub struct CommandAnalysis {
     /// in one compound segment and a local data→interpreter pipe in another don't
     /// combine into a false deny. This is the flag the RCE rule keys on.
     pub has_remote_source_to_interpreter: bool,
+    /// Byte ranges of quoted-string arguments and heredoc bodies that are DATA: they belong to a
+    /// short allowlist of data-carrying commands (echo, printf, fleetmail, ...), contain no
+    /// executing substitution, and the command's output is not piped onward or consumed by a
+    /// substitution. The text rules curl-pipe-python, cat-env-file and cat-ssh-key run with these
+    /// masked out (servitor-udq8). Anything not provably data stays visible to them.
+    pub data_arg_ranges: Vec<Range<usize>>,
     /// Raw AST parse succeeded
     pub parsed: bool,
     /// Error message if parsing failed
@@ -136,6 +143,7 @@ pub fn analyze_command(source: &str) -> CommandAnalysis {
             has_pipe_to_interpreter: false,
             pipe_source_is_remote: false,
             has_remote_source_to_interpreter: false,
+            data_arg_ranges: vec![],
             parsed: false,
             error: Some("Failed to load tree-sitter-bash language".to_string()),
         };
@@ -151,6 +159,7 @@ pub fn analyze_command(source: &str) -> CommandAnalysis {
                 has_pipe_to_interpreter: false,
                 pipe_source_is_remote: false,
                 has_remote_source_to_interpreter: false,
+                data_arg_ranges: vec![],
                 parsed: false,
                 error: Some("Failed to parse command".to_string()),
             };
@@ -175,6 +184,7 @@ fn analyze_tree(tree: &Tree, source: &str) -> CommandAnalysis {
             has_pipe_to_interpreter: false,
             pipe_source_is_remote: false,
             has_remote_source_to_interpreter: false,
+            data_arg_ranges: vec![],
             parsed: false,
             error: Some("AST contains parse errors - using fallback".to_string()),
         };
@@ -190,6 +200,9 @@ fn analyze_tree(tree: &Tree, source: &str) -> CommandAnalysis {
     // Check for pipe to shell patterns
     check_pipelines(&root, source, &mut flags);
 
+    let mut data_arg_ranges = Vec::new();
+    collect_data_arg_ranges(&root, source, false, &mut data_arg_ranges);
+
     CommandAnalysis {
         commands,
         has_dynamic_command,
@@ -197,6 +210,7 @@ fn analyze_tree(tree: &Tree, source: &str) -> CommandAnalysis {
         has_pipe_to_interpreter: flags.pipe_to_interpreter,
         pipe_source_is_remote: flags.source_is_remote,
         has_remote_source_to_interpreter: flags.remote_source_to_interpreter,
+        data_arg_ranges,
         parsed: true,
         error: None,
     }
@@ -405,6 +419,123 @@ fn strip_quotes(s: &str) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// Commands whose quoted arguments are data, not code, when their output goes nowhere that
+/// executes it. `echo`/`printf` only carry data until piped into an interpreter (handled by
+/// the pipeline and substitution checks below).
+const DATA_COMMANDS: &[&str] = &["echo", "printf", "fleetmail", "fleet-ring", "bd", "gh"];
+
+/// True when `text` contains something the shell would execute while expanding it.
+fn has_executing_expansion(text: &str) -> bool {
+    text.contains("$(") || text.contains('`') || text.contains("<(") || text.contains(">(")
+}
+
+/// Normalized, basename'd command name of a `command` node, if it is plain (not dynamic).
+fn data_command_name(cmd: &Node, source: &str) -> Option<String> {
+    let mut cursor = cmd.walk();
+    let name_node = cmd
+        .children(&mut cursor)
+        .find(|c| c.kind() == "command_name")?;
+    let (name, dynamic) = normalize_command_name(&name_node, source);
+    if dynamic {
+        return None;
+    }
+    let base = name.rsplit('/').next().unwrap_or(&name).to_string();
+    DATA_COMMANDS.contains(&base.as_str()).then_some(base)
+}
+
+/// Collect the ranges described on `CommandAnalysis::data_arg_ranges`.
+/// `unsafe_ctx` is true when the node sits where its output may be executed: a non-final
+/// pipeline stage, or inside a command/process substitution.
+fn collect_data_arg_ranges(
+    node: &Node,
+    source: &str,
+    unsafe_ctx: bool,
+    out: &mut Vec<Range<usize>>,
+) {
+    let kind = node.kind();
+
+    // Output of a substitution or a non-final pipeline stage may be run by something else.
+    let child_unsafe =
+        unsafe_ctx || matches!(kind, "command_substitution" | "process_substitution");
+
+    if kind == "pipeline" {
+        let mut cursor = node.walk();
+        let stages: Vec<Node> = node
+            .children(&mut cursor)
+            .filter(|c| matches!(c.kind(), "command" | "redirected_statement"))
+            .collect();
+        let last = stages.len().saturating_sub(1);
+        for (i, stage) in stages.iter().enumerate() {
+            collect_data_arg_ranges(stage, source, unsafe_ctx || i != last, out);
+        }
+        return;
+    }
+
+    if !unsafe_ctx {
+        // Plain command: its quoted-string arguments.
+        if kind == "command" && data_command_name(node, source).is_some() {
+            let mut cursor = node.walk();
+            for arg in node.children(&mut cursor) {
+                if matches!(arg.kind(), "string" | "raw_string") {
+                    if let Ok(text) = arg.utf8_text(source.as_bytes()) {
+                        if !has_executing_expansion(text) {
+                            out.push(arg.byte_range());
+                        }
+                    }
+                }
+            }
+        }
+        // `cmd <<EOF ... EOF`: the heredoc body belongs to the redirected command.
+        if kind == "redirected_statement" {
+            let mut cursor = node.walk();
+            let children: Vec<Node> = node.children(&mut cursor).collect();
+            let body_is_data = children
+                .iter()
+                .find(|c| c.kind() == "command")
+                .is_some_and(|c| data_command_name(c, source).is_some());
+            if body_is_data {
+                for redirect in children.iter().filter(|c| c.kind() == "heredoc_redirect") {
+                    let mut rc = redirect.walk();
+                    for part in redirect.children(&mut rc) {
+                        if part.kind() == "heredoc_body" {
+                            if let Ok(text) = part.utf8_text(source.as_bytes()) {
+                                if !has_executing_expansion(text) {
+                                    out.push(part.byte_range());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_data_arg_ranges(&child, source, child_unsafe, out);
+    }
+}
+
+/// `command` with each range replaced by a neutral token, for running text rules on the
+/// parts the AST did not prove to be data. Ranges come from tree-sitter, so they sit on char
+/// boundaries; overlapping or duplicate ranges are skipped.
+pub fn mask_ranges(command: &str, ranges: &[Range<usize>]) -> String {
+    let mut sorted: Vec<_> = ranges.to_vec();
+    sorted.sort_by_key(|r| (r.start, r.end));
+    let mut out = String::with_capacity(command.len());
+    let mut pos = 0;
+    for r in sorted {
+        if r.start < pos || r.end > command.len() {
+            continue;
+        }
+        out.push_str(&command[pos..r.start]);
+        out.push_str("data-arg-literal");
+        pos = r.end;
+    }
+    out.push_str(&command[pos..]);
+    out
 }
 
 /// Classify each pipeline node and accumulate flags. Source (remote-fetch) and
