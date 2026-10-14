@@ -104,8 +104,8 @@ pub struct CommandAnalysis {
     pub has_remote_source_to_interpreter: bool,
     /// Byte ranges of quoted-string arguments and heredoc bodies that are DATA: they belong to a
     /// short allowlist of data-carrying commands (echo, printf, fleetmail, ...), contain no
-    /// executing substitution, and the command's output is not piped onward or consumed by a
-    /// substitution. The text rules curl-pipe-python, cat-env-file and cat-ssh-key run with these
+    /// executing substitution, and sit in the known-safe shape (top-level statement, no output
+    /// redirect, last child of any pipeline). The text rules curl-pipe-python, cat-env-file and cat-ssh-key run with these
     /// masked out (servitor-udq8). Anything not provably data stays visible to them.
     pub data_arg_ranges: Vec<Range<usize>>,
     /// Raw AST parse succeeded
@@ -201,7 +201,7 @@ fn analyze_tree(tree: &Tree, source: &str) -> CommandAnalysis {
     check_pipelines(&root, source, &mut flags);
 
     let mut data_arg_ranges = Vec::new();
-    collect_data_arg_ranges(&root, source, false, &mut data_arg_ranges);
+    collect_data_arg_ranges(&root, source, &mut data_arg_ranges);
 
     CommandAnalysis {
         commands,
@@ -422,99 +422,142 @@ fn strip_quotes(s: &str) -> String {
 }
 
 /// Commands whose quoted arguments are data, not code, when their output goes nowhere that
-/// executes it. `echo`/`printf` only carry data until piped into an interpreter (handled by
-/// the pipeline and substitution checks below).
+/// executes it. FAIL CLOSED: masking loosens a guard, so a range is masked only for the known-safe
+/// shape (see `collect_data_arg_ranges`), never because a sink was not recognised as bad.
 const DATA_COMMANDS: &[&str] = &["echo", "printf", "fleetmail", "fleet-ring", "bd", "gh"];
+
+/// `gh` and `bd` can store or run text later (`gh alias set`, `gh extension`, `gh api --jq`,
+/// `bd hooks`), so only their plain "write a comment/issue" subcommands count as data commands.
+const GH_DATA_SUBCOMMANDS: &[&str] = &["pr", "issue"];
+const BD_DATA_SUBCOMMANDS: &[&str] = &["create", "update", "comment", "comments", "close", "note"];
 
 /// True when `text` contains something the shell would execute while expanding it.
 fn has_executing_expansion(text: &str) -> bool {
     text.contains("$(") || text.contains('`') || text.contains("<(") || text.contains(">(")
 }
 
-/// Normalized, basename'd command name of a `command` node, if it is plain (not dynamic).
-fn data_command_name(cmd: &Node, source: &str) -> Option<String> {
+/// A `command` node that is a data-carrying command in its safe form (see constants above).
+fn is_data_command(cmd: &Node, source: &str) -> bool {
     let mut cursor = cmd.walk();
-    let name_node = cmd
+    let Some(name_node) = cmd
         .children(&mut cursor)
-        .find(|c| c.kind() == "command_name")?;
+        .find(|c| c.kind() == "command_name")
+    else {
+        return false;
+    };
     let (name, dynamic) = normalize_command_name(&name_node, source);
     if dynamic {
-        return None;
+        return false;
     }
-    let base = name.rsplit('/').next().unwrap_or(&name).to_string();
-    DATA_COMMANDS.contains(&base.as_str()).then_some(base)
+    let base = name.rsplit('/').next().unwrap_or(&name);
+    if !DATA_COMMANDS.contains(&base) {
+        return false;
+    }
+    if base != "gh" && base != "bd" {
+        return true;
+    }
+    // first non-option word after the program name
+    let Some(extracted) = extract_command(cmd, source) else {
+        return false;
+    };
+    let sub = extracted.arguments.iter().find(|a| !a.starts_with('-'));
+    match (base, sub) {
+        ("gh", Some(s)) => GH_DATA_SUBCOMMANDS.contains(&s.as_str()),
+        ("bd", Some(s)) => BD_DATA_SUBCOMMANDS.contains(&s.as_str()),
+        _ => false,
+    }
+}
+
+/// True for a redirect that only feeds STDIN (`<`, `<<`, `<<-`, `<<<`). Every other redirect,
+/// output or descriptor-duplicating, could send the data somewhere that runs it.
+fn is_input_only_redirect(redirect: &Node, source: &str) -> bool {
+    match redirect.kind() {
+        "heredoc_redirect" | "herestring_redirect" => true,
+        "file_redirect" => {
+            let text = redirect.utf8_text(source.as_bytes()).unwrap_or(">");
+            let t = text.trim_start_matches(|c: char| c.is_ascii_digit());
+            t.starts_with('<') && !t.starts_with("<&") && !t.starts_with("<(")
+        }
+        _ => false,
+    }
+}
+
+/// Push the masked ranges of one safe data statement: the quoted-string arguments of `cmd` and,
+/// for `redirected_statement`, the bodies of the heredocs that feed it.
+fn push_data_ranges(stmt: &Node, source: &str, out: &mut Vec<Range<usize>>) {
+    let (cmd, redirects): (Node, Vec<Node>) = if stmt.kind() == "redirected_statement" {
+        let mut cursor = stmt.walk();
+        let children: Vec<Node> = stmt.children(&mut cursor).collect();
+        let Some(body) = children.iter().find(|c| c.kind() == "command") else {
+            return;
+        };
+        let body = *body;
+        let redirects: Vec<Node> = children
+            .into_iter()
+            .filter(|c| !matches!(c.kind(), "command") && c.is_named() && c.id() != body.id())
+            .collect();
+        // ANY redirect that is not input-only means the data may go somewhere else: no mask.
+        if !redirects.iter().all(|r| is_input_only_redirect(r, source)) {
+            return;
+        }
+        (body, redirects)
+    } else {
+        (*stmt, Vec::new())
+    };
+    if !is_data_command(&cmd, source) {
+        return;
+    }
+    let mut cursor = cmd.walk();
+    for arg in cmd.children(&mut cursor) {
+        if matches!(arg.kind(), "string" | "raw_string") {
+            if let Ok(text) = arg.utf8_text(source.as_bytes()) {
+                if !has_executing_expansion(text) {
+                    out.push(arg.byte_range());
+                }
+            }
+        }
+    }
+    for redirect in redirects.iter().filter(|r| r.kind() == "heredoc_redirect") {
+        let mut rc = redirect.walk();
+        for part in redirect.children(&mut rc) {
+            if part.kind() == "heredoc_body" {
+                if let Ok(text) = part.utf8_text(source.as_bytes()) {
+                    if !has_executing_expansion(text) {
+                        out.push(part.byte_range());
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Collect the ranges described on `CommandAnalysis::data_arg_ranges`.
-/// `unsafe_ctx` is true when the node sits where its output may be executed: a non-final
-/// pipeline stage, or inside a command/process substitution.
-fn collect_data_arg_ranges(
-    node: &Node,
-    source: &str,
-    unsafe_ctx: bool,
-    out: &mut Vec<Range<usize>>,
-) {
-    let kind = node.kind();
-
-    // Output of a substitution or a non-final pipeline stage may be run by something else.
-    let child_unsafe =
-        unsafe_ctx || matches!(kind, "command_substitution" | "process_substitution");
-
-    if kind == "pipeline" {
-        let mut cursor = node.walk();
-        let stages: Vec<Node> = node
-            .children(&mut cursor)
-            .filter(|c| matches!(c.kind(), "command" | "redirected_statement"))
-            .collect();
-        let last = stages.len().saturating_sub(1);
-        for (i, stage) in stages.iter().enumerate() {
-            collect_data_arg_ranges(stage, source, unsafe_ctx || i != last, out);
-        }
-        return;
-    }
-
-    if !unsafe_ctx {
-        // Plain command: its quoted-string arguments.
-        if kind == "command" && data_command_name(node, source).is_some() {
+///
+/// Fail closed: only STATEMENTS AT THE TOP LEVEL of the script are considered (the program, and
+/// the statements of a top-level `&&` / `||` / `;` list). A data command is masked only when
+///   - it has no output redirect of any kind (stdin redirects and heredocs are fine);
+///   - if it is in a pipeline, it is the LAST child of that pipeline, counting every child
+///     whatever its kind (so `echo "…" | (bash)` and `echo "…" | { bash; }` are not masked);
+///   - it is not nested in a subshell, group, function, loop, conditional, coproc, or
+///     substitution: nothing below those nodes is visited.
+fn collect_data_arg_ranges(node: &Node, source: &str, out: &mut Vec<Range<usize>>) {
+    match node.kind() {
+        "program" | "list" => {
             let mut cursor = node.walk();
-            for arg in node.children(&mut cursor) {
-                if matches!(arg.kind(), "string" | "raw_string") {
-                    if let Ok(text) = arg.utf8_text(source.as_bytes()) {
-                        if !has_executing_expansion(text) {
-                            out.push(arg.byte_range());
-                        }
-                    }
+            for child in node.children(&mut cursor) {
+                collect_data_arg_ranges(&child, source, out);
+            }
+        }
+        "pipeline" => {
+            let count = node.child_count();
+            if let Some(last) = count.checked_sub(1).and_then(|i| node.child(i)) {
+                if matches!(last.kind(), "command" | "redirected_statement") {
+                    push_data_ranges(&last, source, out);
                 }
             }
         }
-        // `cmd <<EOF ... EOF`: the heredoc body belongs to the redirected command.
-        if kind == "redirected_statement" {
-            let mut cursor = node.walk();
-            let children: Vec<Node> = node.children(&mut cursor).collect();
-            let body_is_data = children
-                .iter()
-                .find(|c| c.kind() == "command")
-                .is_some_and(|c| data_command_name(c, source).is_some());
-            if body_is_data {
-                for redirect in children.iter().filter(|c| c.kind() == "heredoc_redirect") {
-                    let mut rc = redirect.walk();
-                    for part in redirect.children(&mut rc) {
-                        if part.kind() == "heredoc_body" {
-                            if let Ok(text) = part.utf8_text(source.as_bytes()) {
-                                if !has_executing_expansion(text) {
-                                    out.push(part.byte_range());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_data_arg_ranges(&child, source, child_unsafe, out);
+        "command" | "redirected_statement" => push_data_ranges(node, source, out),
+        _ => {}
     }
 }
 

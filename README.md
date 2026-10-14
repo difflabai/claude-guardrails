@@ -261,10 +261,15 @@ If guardrails blocks a legitimate command, you have three options:
 The word-matching rules `curl-pipe-python`, `cat-env-file` and `cat-ssh-key` ignore quoted
 arguments and heredoc bodies of a few data-carrying commands (`echo`, `printf`, `fleetmail`,
 `fleet-ring`, `bd`, `gh`), so a mail body that merely mentions `curl | python3` is not blocked.
-Nothing is ignored when the text contains `$(`, a backtick or `<(`, when the command's output is
-piped into anything (`echo "..." | bash`), when the command sits inside a substitution, or for any
-other command (`bash -c "..."`, `eval`, `ssh host "..."`). Text written to a file and run later
-(`printf ... > x.sh && bash x.sh`) is not covered.
+The rule is fail-closed: a quoted range is ignored only for the known-safe shape. The command must
+be a top-level statement (not in a subshell, group, function, loop, conditional, coproc or
+substitution), have no output redirect at all (stdin redirects and heredocs are fine), and, in a
+pipeline, be the last child (`echo "..." | bash`, `| (bash)`, `| { bash; }` are never ignored). The
+text must contain no `$(`, backtick or `<(`. `gh` and `bd` count only for `gh pr|issue ...` and
+`bd create|update|comment|close|note`; `gh alias`, `gh extension`, `gh api` and `bd hooks` store or
+run text later and never qualify. Every other command (`bash -c "..."`, `eval`, `ssh host "..."`)
+keeps its quoted text visible. Known false blocks: `echo "... cat .env ..." > notes.txt` and a
+`cat <<EOF` heredoc naming `.env`. Text written to a file and run later is not covered.
 
 ## Architecture
 
