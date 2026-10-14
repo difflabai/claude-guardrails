@@ -32,6 +32,11 @@ fn basename(s: &str) -> &str {
 /// True when `token` names a protected secret file. Example/template dotenv files,
 /// and public keys, are not protected.
 pub fn is_protected_path(token: &str) -> bool {
+    // `0<.env`: drop the fd number in front of the redirect operator
+    let token = match token.find('<') {
+        Some(idx) if idx > 0 && token[..idx].chars().all(|c| c.is_ascii_digit()) => &token[idx..],
+        _ => token,
+    };
     let t = token
         .trim_start_matches('<')
         .trim_matches(|c| c == '"' || c == '\'');
@@ -177,6 +182,17 @@ fn segment_reason(seg: &[String], depth: u8) -> Option<&'static str> {
     None
 }
 
+/// rsync `--filter` / `-f` RULE: an exclude/include pattern (`- x`, `+ x`) is a glob and is
+/// skipped. ANY other rule (merge, dir-merge, `.`, `:`, `:-`, unknown) may name a rules FILE, so
+/// its last word is path-checked. Allowlist the safe shape, never list the merge words.
+fn rsync_rule_file(rule: &str) -> Option<&str> {
+    let r = rule.trim_start();
+    if r.starts_with('-') || r.starts_with('+') {
+        return None;
+    }
+    r.split_whitespace().last()
+}
+
 /// The arguments of reader `prog` that are FILES: option values that are patterns,
 /// scripts, variable names or here-strings are data, not files, and are left out.
 fn file_operands<'a>(prog: &str, args: &'a [String]) -> Vec<&'a str> {
@@ -185,12 +201,14 @@ fn file_operands<'a>(prog: &str, args: &'a [String]) -> Vec<&'a str> {
     if prog == "tr" {
         let mut out = Vec::new();
         for (i, a) in args.iter().enumerate() {
-            if a == "<" {
+            // an fd number may precede the operator: `0< .env`, `0<.env`
+            let t = a.trim_start_matches(|c: char| c.is_ascii_digit());
+            if t == "<" {
                 if let Some(v) = args.get(i + 1) {
                     out.push(v.as_str());
                 }
-            } else if a.starts_with('<') && !a.starts_with("<<") {
-                out.push(a.as_str());
+            } else if t.starts_with('<') && !t.starts_with("<<") {
+                out.push(t);
             }
         }
         return out;
@@ -279,7 +297,7 @@ fn file_operands<'a>(prog: &str, args: &'a [String]) -> Vec<&'a str> {
     // Flags whose value is a GLOB or a DELIMITER, never a file: attached, `=` and spaced values
     // are all skipped. `--exclude-from` and friends are NOT here: those values are files.
     let ignore_value: &[&str] = match prog {
-        "rsync" => &["--exclude", "--include", "--filter"],
+        "rsync" => &["--exclude", "--include"],
         "grep" | "egrep" | "fgrep" => &["--exclude", "--include", "--exclude-dir"],
         "diff" => &["-x", "--exclude"],
         "rg" => &["-g", "--glob", "--iglob", "--type-add"],
@@ -348,6 +366,25 @@ fn file_operands<'a>(prog: &str, args: &'a [String]) -> Vec<&'a str> {
         if a == "--" {
             out.extend(args[i + 1..].iter().map(|s| s.as_str()));
             break;
+        }
+        if a.starts_with('-') && a.len() > 1 && prog == "rsync" {
+            let rule = if a == "--filter" || a == "-f" {
+                i += 1;
+                args.get(i).map(String::as_str)
+            } else if let Some(v) = a.strip_prefix("--filter=") {
+                Some(v)
+            } else if !a.starts_with("--") && a.starts_with("-f") {
+                Some(&a[2..])
+            } else {
+                None
+            };
+            if let Some(rule) = rule {
+                if let Some(f) = rsync_rule_file(rule) {
+                    out.push(f);
+                }
+                i += 1;
+                continue;
+            }
         }
         if a.starts_with('-') && a.len() > 1 {
             // --opt=value form: the value is ALWAYS checked, whatever the program and flag.
@@ -679,6 +716,18 @@ mod tests {
             "\\cat .env",
             "/bin/cat .env",
             "bash <<EOF\ncat .env\nEOF",
+            "rsync --filter='merge .env' . /tmp/b",
+            "rsync --filter='. .env' . /tmp/b",
+            "rsync --filter=':- .env' . /tmp/b",
+            "rsync --filter ':- .env' . /tmp/b",
+            "rsync --filter='dir-merge .env' . /tmp/b",
+            "rsync -f'. .env' . /tmp/b",
+            "rsync -f '. .env' . /tmp/b",
+            "tr a b 0< .env",
+            "tr a b 0<.env",
+            "cat 0< .env",
+            "cat 0<.env",
+            "grep KEY 0< .env",
             "awk --source=1 .env",
             "awk -E prog .env",
             "awk -Eprog .env",
@@ -774,6 +823,10 @@ mod tests {
             "tr a b",
             "tr -d .env",
             "tr a-z A-Z < notes.txt",
+            "rsync --filter='- .env' . /tmp/b",
+            "rsync --filter='+ .env' . /tmp/b",
+            "rsync -f'- .env' . /tmp/b",
+            "rsync --filter '- .env' . /tmp/b",
         ] {
             assert!(!blocked(c), "should pass: {c}");
         }
