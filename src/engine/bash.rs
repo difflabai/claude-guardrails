@@ -10,8 +10,20 @@ use crate::parser::ast;
 use crate::parser::{shell, wrapper};
 use crate::rules::dangerous;
 use crate::rules::exfiltration;
+use crate::rules::packs;
+use crate::rules::secret_read;
 
 use regex::RegexSet;
+
+/// `secret-read` (servitor-w8ys): a reader command whose own arguments name a protected
+/// secret path. Token-based, so the same filenames in another command's quoted data
+/// argument (a mail --body) do not match. Honours the `secrets.files` pack switch.
+fn secret_read_decision(text: &str, config: &Config) -> Option<Decision> {
+    if packs::is_disabled(packs::pack_of("secret-read"), &config.packs.disabled) {
+        return None;
+    }
+    secret_read::command_reason(text).map(|reason| Decision::deny("secret-read", reason))
+}
 
 /// Check a bash command for security issues using AST-based analysis
 pub fn check_command(
@@ -74,6 +86,10 @@ pub fn check_command(
         // and arguments together
         let check_str = &cmd.full_command;
 
+        if let Some(decision) = secret_read_decision(check_str, config) {
+            return decision;
+        }
+
         // Also try wrapper unwrapping on the full command
         let unwrapped = wrapper::unwrap_command(check_str, &config.bash.wrappers);
 
@@ -115,6 +131,10 @@ pub fn check_command(
         let part = part.trim();
         if part.is_empty() {
             continue;
+        }
+
+        if let Some(decision) = secret_read_decision(part, config) {
+            return decision;
         }
 
         // Unwrap wrappers
@@ -180,6 +200,10 @@ fn check_command_fallback(
         let part = part.trim();
         if part.is_empty() {
             continue;
+        }
+
+        if let Some(decision) = secret_read_decision(part, config) {
+            return decision;
         }
 
         let unwrapped = wrapper::unwrap_command(part, &config.bash.wrappers);
@@ -788,5 +812,63 @@ mod tests {
             &exfil_rules,
         );
         assert!(decision.is_deny(), "env bash pipe should be caught");
+    }
+
+    // ---- secret-path readers (servitor-w8ys) ----------------------------------------
+
+    fn allowed(command: &str) -> bool {
+        let config = test_config();
+        let (bash_rules, exfil_rules) = compile_rules(SafetyLevel::High);
+        check_command(
+            command,
+            &config,
+            SafetyLevel::High,
+            &bash_rules,
+            &exfil_rules,
+        )
+        .is_allow()
+    }
+
+    #[test]
+    fn test_w8ys_any_reader_of_a_protected_path_blocks() {
+        for c in [
+            "cat .env",
+            "grep -r API_KEY .env",
+            "grep -rn TOKEN ~/work/.env.production",
+            "head -5 ~/.ssh/id_rsa",
+            "tail -n 3 ~/.ssh/id_ed25519",
+            "rg secret ~/.aws/credentials",
+            "less certs/server.pem",
+            "cat server.key",
+            "cat config/secrets.json",
+            "awk '{print}' secrets.yaml",
+            "sed -n 1p .env",
+            "cat *.pem",
+            "cat < .env",
+            "true && cat .env",
+            "ls | grep foo; tail ~/.aws/credentials",
+            "bash -c 'cat .env'",
+            "sh -c 'grep -r K ~/.aws/credentials'",
+            "env FOO=1 head ~/.ssh/id_rsa",
+            "fleetmail send --body hi && head ~/.ssh/id_rsa",
+        ] {
+            assert!(!allowed(c), "must BLOCK: {c}");
+        }
+    }
+
+    #[test]
+    fn test_w8ys_same_names_as_data_arguments_pass() {
+        for c in [
+            "fleetmail send --to X --subject s --body 'we read .env, id_rsa, server.pem and secrets.json'",
+            "echo 'head .env then tail id_rsa'",
+            "printf 'grep -r K ~/.aws/credentials\\n'",
+            "git commit -m 'rotate secrets.json and .env'",
+            "head .env.example", // example files are not protected (the older cat-env-file regex still denies `cat` of them)
+            "head ~/.ssh/id_rsa.pub",
+            "grep credentials README.md",
+            "cat notes.txt",
+        ] {
+            assert!(allowed(c), "must PASS: {c}");
+        }
     }
 }
