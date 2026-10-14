@@ -124,6 +124,12 @@ pub fn check_command(
         }
     }
 
+    // 6b. Secret-path readers on the whole command: the splitter in secret_read is
+    // quote-aware and heredoc-aware, unlike split_compound_command below.
+    if let Some(decision) = secret_read_decision(command, config) {
+        return decision;
+    }
+
     // 7. Also check the raw command for patterns the AST might miss
     // (e.g., compound commands split by ; && ||)
     let parts = shell::split_compound_command(command);
@@ -131,10 +137,6 @@ pub fn check_command(
         let part = part.trim();
         if part.is_empty() {
             continue;
-        }
-
-        if let Some(decision) = secret_read_decision(part, config) {
-            return decision;
         }
 
         // Unwrap wrappers
@@ -194,16 +196,16 @@ fn check_command_fallback(
         return Decision::deny("env-hijacking", "Environment variable hijacking detected");
     }
 
+    if let Some(decision) = secret_read_decision(command, config) {
+        return decision;
+    }
+
     // Split compound commands and check each part
     let parts = shell::split_compound_command(command);
     for part in &parts {
         let part = part.trim();
         if part.is_empty() {
             continue;
-        }
-
-        if let Some(decision) = secret_read_decision(part, config) {
-            return decision;
         }
 
         let unwrapped = wrapper::unwrap_command(part, &config.bash.wrappers);
@@ -850,6 +852,15 @@ mod tests {
             "bash -c 'cat .env'",
             "sh -c 'grep -r K ~/.aws/credentials'",
             "env FOO=1 head ~/.ssh/id_rsa",
+            "nice head .env",
+            "nice -n 5 head .env",
+            "timeout 5 head .env",
+            "timeout -k 2 5 tail ~/.ssh/id_rsa",
+            "stdbuf -oL grep K .env",
+            "ionice -c 3 head .env",
+            "sh <<EOF\nhead .env\nEOF",
+            "git commit -m ok && head .env",
+            "echo 'a; b' && head .env",
             "fleetmail send --body hi && head ~/.ssh/id_rsa",
         ] {
             assert!(!allowed(c), "must BLOCK: {c}");
@@ -865,6 +876,14 @@ mod tests {
             "git commit -m 'rotate secrets.json and .env'",
             "head .env.example", // example files are not protected (the older cat-env-file regex still denies `cat` of them)
             "head ~/.ssh/id_rsa.pub",
+            "git commit -m 'note; head .env; more'",
+            "echo 'a; head .env'",
+            "grep -F '.env' README.md",
+            "grep -e '.env' README.md",
+            "jq --arg note server.pem . data.json",
+            "head <<< '.env'",
+            "wc -l <<EOF\nsee .env and head .env\nEOF", // (the older cat-env-file regex, not this rule, still reads a cat heredoc as a read; servitor-udq8)
+            "fleetmail send --to X --body-stdin <<'EOF'\nhead .env\nread server.pem\nEOF",
             "grep credentials README.md",
             "cat notes.txt",
         ] {

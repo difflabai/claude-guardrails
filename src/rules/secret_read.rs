@@ -6,6 +6,9 @@
 //! is a reader and one of its own arguments (or an input redirect) names a protected
 //! path. The same filenames inside the quoted argument of some other command, such as
 //! a mail `--body`, are not that command's file operands and pass.
+//!
+//! Limits (not covered): `cd dir && cat relative` with a protected name only after the cd, partial
+//! globs, dd/tee/source/git show/curl file://, substitution reads, and shells nested deeper than 3.
 
 /// Programs that print or search file contents.
 const READERS: &[&str] = &[
@@ -99,22 +102,52 @@ fn secret_read_reason_depth(tokens: &[String], depth: u8) -> Option<&'static str
     None
 }
 
+/// Wrapper programs that run the next command, with the options that take a value.
+/// `timeout` also takes one duration operand before the command.
+fn wrapper_valued_options(prog: &str) -> Option<&'static [&'static str]> {
+    match prog {
+        "command" | "builtin" | "exec" | "nohup" | "time" | "setsid" => Some(&[]),
+        "sudo" => Some(&["-u", "-g", "-h", "-p", "-C", "-D", "-R", "-T", "-U"]),
+        "env" => Some(&["-u", "-C", "-S", "-P"]),
+        "nice" => Some(&["-n"]),
+        "ionice" => Some(&["-c", "-n", "-p", "-P", "-u"]),
+        "stdbuf" => Some(&["-i", "-o", "-e"]),
+        "timeout" => Some(&["-k", "-s"]),
+        _ => None,
+    }
+}
+
+fn is_duration(t: &str) -> bool {
+    let t = t.trim_end_matches(['s', 'm', 'h', 'd']);
+    !t.is_empty() && t.chars().all(|c| c.is_ascii_digit() || c == '.')
+}
+
 fn segment_reason(seg: &[String], depth: u8) -> Option<&'static str> {
-    // Skip leading VAR=val assignments and a few transparent prefixes.
+    // Skip leading VAR=val assignments and wrapper programs (with their options).
     let mut i = 0;
     while i < seg.len() {
-        let t = seg[i].as_str();
+        let t = seg[i].trim_start_matches('\\');
         let assignment = t.contains('=') && !t.starts_with('-') && !t.contains('/');
-        if assignment
-            || matches!(
-                t,
-                "command" | "builtin" | "exec" | "nohup" | "time" | "sudo" | "env"
-            )
-        {
+        if assignment {
             i += 1;
-        } else {
-            break;
+            continue;
         }
+        if let Some(valued) = wrapper_valued_options(basename(t)) {
+            let is_timeout = basename(t) == "timeout";
+            i += 1;
+            while i < seg.len() && seg[i].starts_with('-') && seg[i] != "-" {
+                let opt = seg[i].as_str();
+                i += 1;
+                if valued.contains(&opt) && i < seg.len() {
+                    i += 1;
+                }
+            }
+            if is_timeout && i < seg.len() && is_duration(&seg[i]) {
+                i += 1;
+            }
+            continue;
+        }
+        break;
     }
     let prog_tok = seg.get(i)?.trim_start_matches('\\');
     let prog = basename(prog_tok);
@@ -133,25 +166,171 @@ fn segment_reason(seg: &[String], depth: u8) -> Option<&'static str> {
     }
 
     if !READERS.contains(&prog) {
-        // `< .env cat` style: input redirect on any program that is itself a reader is
-        // handled above; a redirect into a non-reader is not a read of the file by it.
         return None;
     }
-    if args.iter().any(|a| is_protected_path(a)) {
+    if file_operands(prog, args)
+        .iter()
+        .any(|a| is_protected_path(a))
+    {
         return Some(REASON);
     }
     None
 }
 
-/// Split `text` at `;`, `&`, `|` and newlines that are outside quotes.
+/// The arguments of reader `prog` that are FILES: option values that are patterns,
+/// scripts, variable names or here-strings are data, not files, and are left out.
+fn file_operands<'a>(prog: &str, args: &'a [String]) -> Vec<&'a str> {
+    // (options whose value is NOT a file, options whose value IS a file)
+    let (skip_value, file_value): (&[&str], &[&str]) = match prog {
+        "grep" | "egrep" | "fgrep" | "rg" | "ag" | "ack" => (
+            &[
+                "-e",
+                "--regexp",
+                "-m",
+                "--max-count",
+                "-A",
+                "-B",
+                "-C",
+                "--context",
+                "--include",
+                "--exclude",
+                "--exclude-dir",
+                "-g",
+                "--glob",
+                "-t",
+                "-T",
+                "--type",
+                "--type-not",
+                "--color",
+                "--colour",
+                "--label",
+                "-d",
+                "-D",
+                "--binary-files",
+                "-M",
+            ],
+            &["-f", "--file"],
+        ),
+        "sed" => (
+            &["-e", "--expression", "-l", "--line-length"],
+            &["-f", "--file"],
+        ),
+        "awk" | "gawk" | "mawk" => (
+            &["-v", "-F", "--assign", "--field-separator"],
+            &["-f", "--file"],
+        ),
+        "jq" | "yq" => (
+            &["--arg", "--argjson", "--indent", "-e"],
+            &["-f", "--from-file", "--slurpfile", "--rawfile"],
+        ),
+        "head" | "tail" => (&["-n", "-c", "--lines", "--bytes"], &[]),
+        "cut" => (&["-d", "-f", "-c", "-b"], &[]),
+        "tr" | "sort" | "uniq" | "column" | "fold" | "fmt" | "od" | "xxd" | "paste" => (
+            &[
+                "-t", "-k", "-n", "-w", "-s", "-d", "-c", "-l", "-o", "-N", "-j", "-S",
+            ],
+            &[],
+        ),
+        _ => (&[], &[]),
+    };
+    // grep family, sed and awk take a first POSITIONAL that is the pattern/script/program,
+    // unless it was supplied by -e / -f.
+    let positional_is_pattern = matches!(
+        prog,
+        "grep"
+            | "egrep"
+            | "fgrep"
+            | "rg"
+            | "ag"
+            | "ack"
+            | "sed"
+            | "awk"
+            | "gawk"
+            | "mawk"
+            | "jq"
+            | "yq"
+    );
+    let mut have_pattern_opt = false;
+    let mut out = Vec::new();
+    let mut i = 0;
+    let mut pattern_pending = positional_is_pattern;
+    while i < args.len() {
+        let a = args[i].as_str();
+        // here-string: the operand is data, never a file
+        if a == "<<<" {
+            i += 2;
+            continue;
+        }
+        if a.starts_with("<<<") {
+            i += 1;
+            continue;
+        }
+        if a == "--" {
+            out.extend(args[i + 1..].iter().map(|s| s.as_str()));
+            break;
+        }
+        if a.starts_with('-') && a.len() > 1 {
+            // --opt=value form
+            if let Some((name, value)) = a.split_once('=') {
+                if file_value.contains(&name) {
+                    out.push(value);
+                } else if matches!(name, "-e" | "--regexp" | "--expression") {
+                    have_pattern_opt = true;
+                }
+                i += 1;
+                continue;
+            }
+            if file_value.contains(&a) {
+                have_pattern_opt = have_pattern_opt || matches!(a, "-f" | "--file" | "--from-file");
+                if let Some(v) = args.get(i + 1) {
+                    out.push(v.as_str());
+                }
+                i += 2;
+                continue;
+            }
+            if skip_value.contains(&a) {
+                if matches!(a, "-e" | "--regexp" | "--expression") {
+                    have_pattern_opt = true;
+                }
+                // --arg / --argjson take NAME VALUE
+                i += if matches!(a, "--arg" | "--argjson") {
+                    3
+                } else {
+                    2
+                };
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        // positional
+        if pattern_pending && !have_pattern_opt {
+            pattern_pending = false; // this one is the pattern / script / filter
+        } else {
+            out.push(a);
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Split `text` at `;`, `&`, `|` and newlines that are outside quotes. Heredoc bodies are
+/// cut out: they are data for the command they feed, except for a shell, whose body is a
+/// script and is returned as a part of its own.
 fn split_unquoted(text: &str) -> Vec<String> {
-    let mut parts = Vec::new();
+    let mut parts: Vec<String> = Vec::new();
     let mut cur = String::new();
     let (mut single, mut double, mut escaped) = (false, false, false);
-    for ch in text.chars() {
+    let mut pending: Vec<String> = Vec::new(); // heredoc delimiters seen on this line
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    let mut line_parts_start = 0usize;
+    while i < chars.len() {
+        let ch = chars[i];
         if escaped {
             cur.push(ch);
             escaped = false;
+            i += 1;
             continue;
         }
         match ch {
@@ -167,11 +346,73 @@ fn split_unquoted(text: &str) -> Vec<String> {
                 double = !double;
                 cur.push(ch);
             }
-            ';' | '&' | '|' | '\n' if !single && !double => {
+            '<' if !single
+                && !double
+                && chars.get(i + 1) == Some(&'<')
+                && chars.get(i + 2) != Some(&'<')
+                && !(i > 0 && chars[i - 1] == '<') =>
+            {
+                // heredoc operator: read the delimiter word
+                let mut j = i + 2;
+                if chars.get(j) == Some(&'-') {
+                    j += 1;
+                }
+                while chars.get(j) == Some(&' ') {
+                    j += 1;
+                }
+                let mut delim = String::new();
+                while let Some(&c) = chars.get(j) {
+                    if c.is_whitespace() || matches!(c, ';' | '&' | '|' | '<' | '>') {
+                        break;
+                    }
+                    if !matches!(c, '\'' | '"' | '\\') {
+                        delim.push(c);
+                    }
+                    j += 1;
+                }
+                if !delim.is_empty() {
+                    pending.push(delim);
+                }
+                cur.push_str("<<");
+                i += 2;
+                continue;
+            }
+            '\n' if !single && !double => {
+                let first_word = cur.split_whitespace().next().unwrap_or("").to_string();
+                let feeds_shell = SHELLS.contains(&basename(&first_word));
+                parts.push(std::mem::take(&mut cur));
+                // consume heredoc bodies that begin on the next line
+                let mut k = i + 1;
+                for delim in pending.drain(..) {
+                    let mut body = String::new();
+                    loop {
+                        let end = chars[k..].iter().position(|&c| c == '\n').map(|p| k + p);
+                        let line: String = chars[k..end.unwrap_or(chars.len())].iter().collect();
+                        k = end.map_or(chars.len(), |e| e + 1);
+                        if line.trim_start_matches('\t').trim_end() == delim || k >= chars.len() {
+                            if line.trim_start_matches('\t').trim_end() != delim {
+                                body.push_str(&line);
+                            }
+                            break;
+                        }
+                        body.push_str(&line);
+                        body.push('\n');
+                    }
+                    if feeds_shell {
+                        parts.push(body);
+                    }
+                }
+                let _ = line_parts_start;
+                line_parts_start = parts.len();
+                i = k;
+                continue;
+            }
+            ';' | '&' | '|' if !single && !double => {
                 parts.push(std::mem::take(&mut cur));
             }
             _ => cur.push(ch),
         }
+        i += 1;
     }
     parts.push(cur);
     parts
@@ -208,6 +449,7 @@ mod tests {
             "cat /app/.env.local",
             "grep -r KEY .env",
             "grep -rn TOKEN ~/work/.env.production",
+            "grep -e KEY -f .env",
             "head -5 ~/.ssh/id_rsa",
             "tail -n 3 ~/.ssh/id_ed25519",
             "rg secret ~/.aws/credentials",
@@ -216,6 +458,9 @@ mod tests {
             "cat config/secrets.json",
             "awk '{print}' secrets.yaml",
             "sed -n 1p .env",
+            "sed -e 's/a/b/' .env",
+            "jq . secrets.json",
+            "jq --arg k v . .env",
             "cat *.pem",
             "cat .env*",
             "cat prod.env",
@@ -229,7 +474,7 @@ mod tests {
     }
 
     #[test]
-    fn compound_pipe_and_bash_c_block() {
+    fn compound_pipe_wrapper_and_bash_c_block() {
         for c in [
             "true && cat .env",
             "echo hi; head ~/.ssh/id_rsa",
@@ -237,9 +482,19 @@ mod tests {
             "bash -c 'cat .env'",
             "sh -c \"grep -r K ~/.aws/credentials\"",
             "env FOO=1 cat .env",
+            "env -i FOO=1 cat .env",
             "sudo cat ~/.ssh/id_rsa",
+            "sudo -u root cat ~/.ssh/id_rsa",
+            "nice head .env",
+            "nice -n 5 head .env",
+            "timeout 5 head .env",
+            "timeout -k 2 5 head .env",
+            "stdbuf -oL tail .env",
+            "ionice -c 3 head .env",
+            "nohup cat .env",
             "\\cat .env",
             "/bin/cat .env",
+            "bash <<EOF\ncat .env\nEOF",
         ] {
             assert!(blocked(c), "should block: {c}");
         }
@@ -250,8 +505,22 @@ mod tests {
         for c in [
             "fleetmail send --to X --subject s --body 'we read .env and id_rsa and server.pem'",
             "echo \"cat .env\"",
+            "echo 'a; head .env'",
+            "git commit -m 'note; head .env; more'",
+            "git commit -m \"rotate secrets.json && cat server.key\"",
+            "grep -F '.env' README.md",
+            "grep -e '.env' README.md",
+            "grep '.env' README.md",
+            "rg id_rsa src/",
+            "sed -n '/server.pem/p' notes.txt",
+            "awk '/secrets.json/' notes.txt",
+            "jq --arg note server.pem . data.json",
+            "jq '.[] | select(.f == \"server.pem\")' data.json",
+            "head <<< '.env'",
+            "head <<<'.env'",
+            "cat <<EOF\nsee .env and head .env\nEOF",
+            "fleetmail send --to X --body-stdin <<'EOF'\nhead .env\ncat server.pem\nEOF",
             "printf 'grep -r K ~/.aws/credentials\\n'",
-            "git commit -m 'rotate secrets.json and .env'",
             "cat .env.example",
             "cat .env.sample",
             "cat README.md",
@@ -263,5 +532,12 @@ mod tests {
         ] {
             assert!(!blocked(c), "should pass: {c}");
         }
+    }
+
+    #[test]
+    fn heredoc_body_of_a_non_shell_is_data_but_a_shell_body_is_code() {
+        assert!(!blocked("cat <<EOF\nhead .env\nEOF"));
+        assert!(blocked("sh <<EOF\nhead .env\nEOF"));
+        assert!(blocked("cat <<EOF\nx\nEOF\nhead .env"));
     }
 }
