@@ -271,6 +271,13 @@ run text later and never qualify. Every other command (`bash -c "..."`, `eval`, 
 keeps its quoted text visible. Known false blocks: `echo "... cat .env ..." > notes.txt` and a
 `cat <<EOF` heredoc naming `.env`. Text written to a file and run later is not covered.
 
+A script that could rewire a later command gets no mask at all (all text rules run on the raw
+text): `exec` (any form), `coproc`, `alias`, `unalias`, `shopt`, `enable`, `hash`, `trap`,
+`source` or `.`, `builtin`, a function definition, an assignment to or prefix of `PATH`,
+`BASH_ENV`, `ENV`, `IFS` or `BASH_FUNC_*`, and any `set` other than `-e`, `-u` and `-o
+errexit|nounset|pipefail`. The `gh`/`bd` subcommand must be the word directly after the program
+name, so `gh -R o/r pr comment ...` is not masked. Not covered: shell history tricks (`fc -ln`).
+
 ## Architecture
 
 ```

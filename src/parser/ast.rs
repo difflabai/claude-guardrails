@@ -201,7 +201,9 @@ fn analyze_tree(tree: &Tree, source: &str) -> CommandAnalysis {
     check_pipelines(&root, source, &mut flags);
 
     let mut data_arg_ranges = Vec::new();
-    collect_data_arg_ranges(&root, source, &mut data_arg_ranges);
+    if !script_can_rewire(&root, source) {
+        collect_data_arg_ranges(&root, source, &mut data_arg_ranges);
+    }
 
     CommandAnalysis {
         commands,
@@ -460,7 +462,9 @@ fn is_data_command(cmd: &Node, source: &str) -> bool {
     let Some(extracted) = extract_command(cmd, source) else {
         return false;
     };
-    let sub = extracted.arguments.iter().find(|a| !a.starts_with('-'));
+    // the subcommand counts only when it is the word DIRECTLY after the program name:
+    // `gh -R o/r pr comment` is not masked (conservative, as at base)
+    let sub = extracted.arguments.first();
     match (base, sub) {
         ("gh", Some(s)) => GH_DATA_SUBCOMMANDS.contains(&s.as_str()),
         ("bd", Some(s)) => BD_DATA_SUBCOMMANDS.contains(&s.as_str()),
@@ -529,6 +533,86 @@ fn push_data_ranges(stmt: &Node, source: &str, out: &mut Vec<Range<usize>>) {
             }
         }
     }
+}
+
+/// Builtins that change what a later command word means, or run text from elsewhere.
+const REWIRING_BUILTINS: &[&str] = &[
+    "exec", "coproc", "alias", "unalias", "shopt", "enable", "hash", "trap", "source", ".", "builtin",
+];
+
+/// Variables whose value changes how later commands are found or started.
+fn is_rewiring_variable(name: &str) -> bool {
+    matches!(name, "PATH" | "BASH_ENV" | "ENV" | "IFS") || name.starts_with("BASH_FUNC_")
+}
+
+/// `set` is harmless only for errexit, nounset and pipefail.
+fn is_safe_set(args: &[String]) -> bool {
+    let mut i = 0;
+    if args.is_empty() {
+        return false;
+    }
+    while i < args.len() {
+        let a = args[i].as_str();
+        let Some(flags) = a.strip_prefix('-').or_else(|| a.strip_prefix('+')) else {
+            return false;
+        };
+        if flags.is_empty() || !flags.chars().all(|c| matches!(c, 'e' | 'u' | 'o')) {
+            return false;
+        }
+        if flags.contains('o') {
+            i += 1;
+            match args.get(i).map(String::as_str) {
+                Some("errexit" | "nounset" | "pipefail") => {}
+                _ => return false,
+            }
+        }
+        i += 1;
+    }
+    true
+}
+
+/// True when anything in the script, anywhere, could make a LATER data command run something
+/// else: `exec` redirects, alias/function/coproc/trap/source definitions, PATH-style variables,
+/// `set` options. FAIL CLOSED: such a script gets no mask at all (base behaviour). History
+/// tricks (`fc -ln`) are out of scope and listed in the README.
+fn script_can_rewire(node: &Node, source: &str) -> bool {
+    match node.kind() {
+        "function_definition" | "coproc" => return true,
+        "variable_assignment" => {
+            let name = node
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+                .unwrap_or("");
+            if is_rewiring_variable(name) {
+                return true;
+            }
+        }
+        "command" => {
+            let mut cursor = node.walk();
+            let name_node = node
+                .children(&mut cursor)
+                .find(|c| c.kind() == "command_name");
+            if let Some(name_node) = name_node {
+                let (name, _) = normalize_command_name(&name_node, source);
+                let base = name.rsplit('/').next().unwrap_or(&name);
+                if base == "." || REWIRING_BUILTINS.contains(&base) {
+                    return true;
+                }
+                if base == "set" {
+                    let args = extract_command(node, source)
+                        .map(|c| c.arguments)
+                        .unwrap_or_default();
+                    if !is_safe_set(&args) {
+                        return true;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    let children: Vec<Node> = node.children(&mut cursor).collect();
+    children.iter().any(|c| script_can_rewire(c, source))
 }
 
 /// Collect the ranges described on `CommandAnalysis::data_arg_ranges`.
