@@ -121,7 +121,7 @@ pub fn pack_of(id: &str) -> &'static str {
         | "kube-config" | "pem-file" | "p12-file" | "key-file" | "credentials-json"
         | "secrets-file" | "docker-config" | "netrc" | "npmrc" | "pypirc" | "pgpass" | "my-cnf"
         | "gcp-credentials" | "azure-profile" | "github-token" | "gnupg-keyring"
-        | "config-with-auth" | "htpasswd" | "shadow" | "passwd" => "secrets.files",
+        | "config-with-auth" | "htpasswd" | "shadow" | "passwd" | "secret-read" => "secrets.files",
 
         // exfil — everything in exfiltration.rs is prefixed distinctively
         id if is_exfil(id) => "exfil",

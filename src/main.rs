@@ -253,6 +253,15 @@ fn main() {
 
     let args = Args::parse();
 
+    // FAIL CLOSED on panic. Release builds abort on panic, and an abort prints nothing, which
+    // Claude Code treats as "allow". The hook runs before the abort: say deny, exit 0.
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("claude-guardrails: internal error (denying): {info}");
+        println!("{}", claude_guardrails::output::panic_deny_json());
+        let _ = io::stdout().flush();
+        std::process::exit(0);
+    }));
+
     // Handle help and version
     if args.help {
         print_help();

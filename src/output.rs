@@ -103,6 +103,17 @@ impl Decision {
     }
 }
 
+/// The JSON the panic hook prints: a panic anywhere in the checks DENIES the command. The
+/// release profile aborts on panic and an abort prints nothing, which Claude Code reads as
+/// "allow", so every rule would fail open for that command.
+pub fn panic_deny_json() -> String {
+    HookOutput::deny_with_rule(
+        "internal-error",
+        "the guardrail hit an internal error while checking this command, so it is denied",
+    )
+    .to_json()
+}
+
 impl HookOutput {
     /// Create an allow response (empty output = allow)
     pub fn allow() -> Self {
