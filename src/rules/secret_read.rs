@@ -182,6 +182,13 @@ fn segment_reason(seg: &[String], depth: u8) -> Option<&'static str> {
     None
 }
 
+/// `a` without its leading `-` and the ONE character after it, cut on a char boundary: a short
+/// option may carry a multi-byte second character (`-é.env`), which a byte slice `a[2..]` would
+/// split and panic on.
+fn after_flag_char(a: &str) -> &str {
+    a.char_indices().nth(2).map_or("", |(i, _)| &a[i..])
+}
+
 /// rsync `--filter` / `-f` RULE: an exclude/include pattern (`- x`, `+ x`) is a glob and is
 /// skipped. ANY other rule (merge, dir-merge, `.`, `:`, `:-`, unknown) may name a rules FILE, so
 /// its last word is path-checked. Allowlist the safe shape, never list the merge words.
@@ -455,9 +462,7 @@ fn file_operands<'a>(prog: &str, args: &'a [String]) -> Vec<&'a str> {
                     i += 1;
                     continue;
                 }
-                if combined_f
-                    && a.ends_with('f')
-                    && a[1..].chars().all(|c| c.is_ascii_alphabetic())
+                if combined_f && a.ends_with('f') && a[1..].chars().all(|c| c.is_ascii_alphabetic())
                 {
                     have_pattern_opt = true;
                     if let Some(v) = args.get(i + 1) {
@@ -466,7 +471,7 @@ fn file_operands<'a>(prog: &str, args: &'a [String]) -> Vec<&'a str> {
                     i += 2;
                     continue;
                 }
-                out.push(&a[2..]);
+                out.push(after_flag_char(a));
                 if a.starts_with("-e") || a.starts_with("-f") || prog_flag(pre) {
                     have_pattern_opt = true; // -ePATTERN / -fFILE supplied the pattern
                 }
@@ -611,6 +616,28 @@ mod tests {
 
     fn blocked(c: &str) -> bool {
         command_reason(c).is_some()
+    }
+
+    #[test]
+    fn multibyte_short_option_does_not_panic() {
+        // regression: `a[2..]` split a multi-byte second character and panicked (abort)
+        for c in [
+            "grep -é KEY README.md",
+            "grep -éé KEY README.md",
+            "cat -é .env",
+            "sed -日本 p x.txt",
+            "rg -ñ.env KEY",
+            "awk -é 1 x.txt",
+            "rsync -é . /tmp/b",
+        ] {
+            let _ = command_reason(c);
+        }
+        assert!(blocked("cat -é .env"));
+        assert!(blocked("grep -é.env KEY"));
+        assert!(!blocked("grep -é KEY README.md"));
+        assert_eq!(after_flag_char("-é.env"), ".env");
+        assert_eq!(after_flag_char("-éé"), "é");
+        assert_eq!(after_flag_char("-é"), "");
     }
 
     #[test]

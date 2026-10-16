@@ -883,6 +883,19 @@ mod tests {
     }
 
     #[test]
+    fn test_w8ys_multibyte_option_in_compound_does_not_hide_later_rules() {
+        // a short option with a multi-byte second char used to panic (abort = no output = allow)
+        for c in [
+            "grep -é KEY README.md; rm -rf /",
+            "grep -é KEY README.md && rm -rf /",
+            "cat -日 notes.txt && rm -rf /",
+            "grep -é KEY README.md; cat .env",
+        ] {
+            assert!(!allowed(c), "must BLOCK: {c}");
+        }
+    }
+
+    #[test]
     fn test_w8ys_same_names_as_data_arguments_pass() {
         for c in [
             "fleetmail send --to X --subject s --body 'we read .env, id_rsa, server.pem and secrets.json'",
