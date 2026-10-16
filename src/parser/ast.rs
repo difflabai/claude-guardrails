@@ -519,16 +519,30 @@ fn is_input_only_redirect(redirect: &Node, source: &str) -> bool {
     }
 }
 
-/// True when the heredoc's delimiter word is quoted or backslash-escaped.
-fn heredoc_delimiter_quoted(redirect: &Node, source: &str) -> bool {
+/// The heredoc delimiter WORD when, and only when, its source text is exactly one simple word
+/// fully wrapped in one pair of matching quotes: `'EOF'` or `"EOF"`. Mixed quoting (`E"OF"`),
+/// `$'EOF'`, a backslash, an empty word or partial quotes return None: tree-sitter reads such a
+/// delimiter literally while bash strips the quoting and ends the body at the bare word, so the
+/// two can disagree about where the body stops.
+fn simple_quoted_delimiter<'a>(redirect: &Node, source: &'a str) -> Option<&'a str> {
     let mut cursor = redirect.walk();
     let start = redirect
         .children(&mut cursor)
-        .find(|c| c.kind() == "heredoc_start");
-    match start.and_then(|n| n.utf8_text(source.as_bytes()).ok()) {
-        Some(t) => t.contains(['\'', '"', '\\']),
-        None => false,
-    }
+        .find(|c| c.kind() == "heredoc_start")?;
+    let t = start.utf8_text(source.as_bytes()).ok()?;
+    let inner = t
+        .strip_prefix('\'')
+        .and_then(|r| r.strip_suffix('\''))
+        .or_else(|| t.strip_prefix('"').and_then(|r| r.strip_suffix('"')))?;
+    let simple = !inner.is_empty() && inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    simple.then_some(inner)
+}
+
+/// True when some body line, with leading spaces/tabs and a trailing CR removed, equals the
+/// delimiter word: bash could end the heredoc there while tree-sitter does not, so refuse.
+fn body_has_terminator_line(body: &str, word: &str) -> bool {
+    body.lines()
+        .any(|l| l.trim_start_matches([' ', '\t']).trim_end_matches('\r') == word)
 }
 
 /// Push the masked ranges of one safe data statement: the quoted-string arguments of `cmd` and,
@@ -579,7 +593,8 @@ fn push_data_ranges(stmt: &Node, source: &str, out: &mut Vec<Range<usize>>) {
                 .chars()
                 .filter(|c| !matches!(c, '"' | '\'' | '\\'))
                 .collect();
-            if w.starts_with('-') && !INLINE_TEXT_FLAGS.contains(&w.as_str()) {
+            // a `$` in the token (`$F`, `$'--body-file'`, `${F:---body-file}`) may build a flag
+            if (w.starts_with('-') && !INLINE_TEXT_FLAGS.contains(&w.as_str())) || w.contains('$') {
                 continue;
             }
         }
@@ -594,16 +609,16 @@ fn push_data_ranges(stmt: &Node, source: &str, out: &mut Vec<Range<usize>>) {
         }
     }
     for redirect in redirects.iter().filter(|r| r.kind() == "heredoc_redirect") {
-        // Only a QUOTED delimiter (<<'EOF', <<"EOF", <<\EOF) means bash does no expansion in the
-        // body. An unquoted body joins backslash-newline and runs `$(...)` built across lines.
-        if !heredoc_delimiter_quoted(redirect, source) {
+        // Only ONE fully quoted simple delimiter (<<'EOF' or <<"EOF") means bash does no
+        // expansion in the body AND reads the same delimiter word tree-sitter does.
+        let Some(word) = simple_quoted_delimiter(redirect, source) else {
             continue;
-        }
+        };
         let mut rc = redirect.walk();
         for part in redirect.children(&mut rc) {
             if part.kind() == "heredoc_body" {
                 if let Ok(text) = part.utf8_text(source.as_bytes()) {
-                    if is_plain_text(text) {
+                    if is_plain_text(text) && !body_has_terminator_line(text, word) {
                         out.push(part.byte_range());
                     }
                 }
@@ -999,5 +1014,32 @@ mod tests {
             analysis.has_pipe_to_interpreter,
             "xargs python should be detected as pipe to interpreter"
         );
+    }
+
+    #[test]
+    fn heredoc_terminator_line_check() {
+        // bash may end a heredoc at a line tree-sitter keeps in the body: refuse to mask then
+        assert!(body_has_terminator_line("a\nEOF\nb", "EOF"));
+        assert!(body_has_terminator_line("a\n  EOF\nb", "EOF"));
+        assert!(body_has_terminator_line("a\n\tEOF\nb", "EOF"));
+        assert!(body_has_terminator_line("a\nEOF\r\nb", "EOF"));
+        assert!(!body_has_terminator_line("a\nEOF x\nb", "EOF"));
+        assert!(!body_has_terminator_line("a\nmy EOF\nb", "EOF"));
+        assert!(!body_has_terminator_line("a\nb", "EOF"));
+    }
+
+    #[test]
+    fn heredoc_only_one_fully_quoted_simple_delimiter_is_masked() {
+        let masked = |c: &str| !analyze_command(c).data_arg_ranges.is_empty();
+        for d in ["'EOF'", "\"EOF\""] {
+            let c = format!("fleetmail send --body-stdin <<{d}\nwe saw words\nEOF");
+            assert!(masked(&c), "should mask: {c}");
+        }
+        for d in [
+            "EOF", "E\"OF\"", "$'EOF'", "E'OF'", "E\\OF", "\"E\"OF", "E'O'F",
+        ] {
+            let c = format!("fleetmail send --body-stdin <<{d}\nwe saw words\nEOF");
+            assert!(!masked(&c), "must not mask: {c}");
+        }
     }
 }

@@ -271,9 +271,15 @@ subshell, group, comment or trailing `&`/`;`. The command name must be bare (`ec
 `./echo`, `/bin/echo` or `\echo`). The quoted text must contain no `$(`, backtick, `<(` or `>(`
 and NO BACKSLASH at all: bash deletes backslash-newline before it parses an expansion, so
 `"x$\<NL>(cmd)"` runs `cmd` while the text shows no `$(`. Heredoc bodies are masked only when
-the delimiter is quoted (`<<'EOF'`); an unquoted body is expanded by bash. A string that is the
+the delimiter is exactly one simple word (letters, digits, `_`) fully wrapped in one pair of
+matching quotes (`<<'EOF'` or `<<"EOF"`) and no body line equals that word (after trimming
+leading spaces/tabs and a trailing CR). Mixed quoting (`E"OF"`), `$'EOF'` and a backslash are
+never masked: tree-sitter reads such a delimiter literally while bash strips the quoting and ends
+the body at the bare word, so the two can disagree about where the body stops. An unquoted body
+is expanded by bash. A string that is the
 value of a flag is masked only for the inline-text flags (`--body`, `--title`, `-d`, `-m`, ...),
-never for `--body-file`, `-F` or unknown flags, whose value may be a file name; a quoted token
+never for `--body-file`, `-F`, unknown flags, or a flag name containing `$` (it may build a
+flag), whose value may be a file name; a quoted token
 that itself starts with `-` is never masked. Anything else gets no mask, and every rule then
 runs on the raw text exactly as without this feature.
 
