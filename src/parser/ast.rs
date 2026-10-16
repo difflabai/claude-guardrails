@@ -5,6 +5,7 @@
 
 use once_cell::sync::Lazy;
 use std::collections::HashSet;
+use std::ops::Range;
 use tree_sitter::{Node, Parser, Tree};
 
 /// Shell interpreters that are dangerous when used as pipe targets
@@ -101,6 +102,12 @@ pub struct CommandAnalysis {
     /// in one compound segment and a local data→interpreter pipe in another don't
     /// combine into a false deny. This is the flag the RCE rule keys on.
     pub has_remote_source_to_interpreter: bool,
+    /// Byte ranges of quoted-string arguments and heredoc bodies that are DATA: they belong to a
+    /// short allowlist of data-carrying commands (echo, printf, fleetmail, ...), contain no
+    /// executing substitution, and sit in the known-safe shape (top-level statement, no output
+    /// redirect, last child of any pipeline). The text rules curl-pipe-python, cat-env-file and cat-ssh-key run with these
+    /// masked out. Anything not provably data stays visible to them.
+    pub data_arg_ranges: Vec<Range<usize>>,
     /// Raw AST parse succeeded
     pub parsed: bool,
     /// Error message if parsing failed
@@ -136,6 +143,7 @@ pub fn analyze_command(source: &str) -> CommandAnalysis {
             has_pipe_to_interpreter: false,
             pipe_source_is_remote: false,
             has_remote_source_to_interpreter: false,
+            data_arg_ranges: vec![],
             parsed: false,
             error: Some("Failed to load tree-sitter-bash language".to_string()),
         };
@@ -151,6 +159,7 @@ pub fn analyze_command(source: &str) -> CommandAnalysis {
                 has_pipe_to_interpreter: false,
                 pipe_source_is_remote: false,
                 has_remote_source_to_interpreter: false,
+                data_arg_ranges: vec![],
                 parsed: false,
                 error: Some("Failed to parse command".to_string()),
             };
@@ -175,6 +184,7 @@ fn analyze_tree(tree: &Tree, source: &str) -> CommandAnalysis {
             has_pipe_to_interpreter: false,
             pipe_source_is_remote: false,
             has_remote_source_to_interpreter: false,
+            data_arg_ranges: vec![],
             parsed: false,
             error: Some("AST contains parse errors - using fallback".to_string()),
         };
@@ -190,6 +200,9 @@ fn analyze_tree(tree: &Tree, source: &str) -> CommandAnalysis {
     // Check for pipe to shell patterns
     check_pipelines(&root, source, &mut flags);
 
+    let mut data_arg_ranges = Vec::new();
+    collect_data_arg_ranges(&root, source, &mut data_arg_ranges);
+
     CommandAnalysis {
         commands,
         has_dynamic_command,
@@ -197,6 +210,7 @@ fn analyze_tree(tree: &Tree, source: &str) -> CommandAnalysis {
         has_pipe_to_interpreter: flags.pipe_to_interpreter,
         pipe_source_is_remote: flags.source_is_remote,
         has_remote_source_to_interpreter: flags.remote_source_to_interpreter,
+        data_arg_ranges,
         parsed: true,
         error: None,
     }
@@ -405,6 +419,236 @@ fn strip_quotes(s: &str) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// Commands whose quoted arguments are data, not code, when their output goes nowhere that
+/// executes it. FAIL CLOSED: masking loosens a guard, so a range is masked only for the known-safe
+/// shape (see `collect_data_arg_ranges`), never because a sink was not recognised as bad.
+const DATA_COMMANDS: &[&str] = &["echo", "printf", "fleetmail", "fleet-ring", "bd", "gh"];
+
+/// `gh` and `bd` can store or run text later (`gh alias set`, `gh extension`, `gh api --jq`,
+/// `bd hooks`), so only their plain "write a comment/issue" subcommands count as data commands.
+const GH_DATA_SUBCOMMANDS: &[&str] = &["pr", "issue"];
+const BD_DATA_SUBCOMMANDS: &[&str] = &["create", "update", "comment", "comments", "close", "note"];
+
+/// Flags whose following value is inline text (a body, title or message), not a file name.
+/// Allowlist: the value of any other flag is never masked.
+const INLINE_TEXT_FLAGS: &[&str] = &[
+    "--body",
+    "-b",
+    "--title",
+    "-t",
+    "--message",
+    "-m",
+    "--subject",
+    "--description",
+    "-d",
+    "--design",
+    "--acceptance",
+    "--notes",
+    "--note",
+    "--comment",
+    "--reason",
+    "--text",
+];
+
+/// True when `text` contains something the shell would execute while expanding it.
+fn has_executing_expansion(text: &str) -> bool {
+    text.contains("$(") || text.contains('`') || text.contains("<(") || text.contains(">(")
+}
+
+/// A range is masked only if it is plain text. Any BACKSLASH disqualifies it: bash removes
+/// backslash-newline before it parses an expansion, so `"x$\<NL>(cmd)"` runs `cmd` while the
+/// literal text shows no `$(`. Refusing every backslash closes that whole escape class; such a
+/// body is an accepted false block (base behaviour).
+fn is_plain_text(text: &str) -> bool {
+    !has_executing_expansion(text) && !text.contains('\\')
+}
+
+/// A `command` node that is a data-carrying command in its safe form (see constants above).
+fn is_data_command(cmd: &Node, source: &str) -> bool {
+    let mut cursor = cmd.walk();
+    let Some(name_node) = cmd
+        .children(&mut cursor)
+        .find(|c| c.kind() == "command_name")
+    else {
+        return false;
+    };
+    let (name, dynamic) = normalize_command_name(&name_node, source);
+    if dynamic {
+        return false;
+    }
+    // a BARE name only, taken from the SOURCE text (the normalised name drops the path):
+    // `./echo`, `/bin/echo` or `/tmp/x/echo` may be any executable
+    let raw = name_node.utf8_text(source.as_bytes()).unwrap_or("");
+    if raw != name {
+        return false;
+    }
+    let base = name.as_str();
+    if !DATA_COMMANDS.contains(&base) {
+        return false;
+    }
+    if base != "gh" && base != "bd" {
+        return true;
+    }
+    // first non-option word after the program name
+    let Some(extracted) = extract_command(cmd, source) else {
+        return false;
+    };
+    // the subcommand counts only when it is the word DIRECTLY after the program name:
+    // `gh -R o/r pr comment` is not masked (conservative, as at base)
+    let sub = extracted.arguments.first();
+    match (base, sub) {
+        ("gh", Some(s)) => GH_DATA_SUBCOMMANDS.contains(&s.as_str()),
+        ("bd", Some(s)) => BD_DATA_SUBCOMMANDS.contains(&s.as_str()),
+        _ => false,
+    }
+}
+
+/// The CLOSED allowlist of tree-sitter node kinds a masked command may contain. The mask is
+/// granted only when EVERY node in the whole tree is one of these (or an allowed token), so a
+/// shape nobody thought of (a redirect, a heredoc, a substitution, a concatenation, a pipeline
+/// nested where the grammar puts it) carries a kind that is not listed and gets no mask: the
+/// base verdict. Reviewing the mask means reviewing this one list.
+const MASK_NODE_KINDS: &[&str] = &[
+    "program",
+    "command",
+    "command_name",
+    "word",
+    "number",
+    "raw_string",
+    "string",
+    "string_content",
+];
+
+/// Anonymous tokens the mask accepts: the double quote that delimits a `string`.
+const MASK_TOKEN_KINDS: &[&str] = &["\""];
+
+/// True when `node` and every node below it is on the allowlist, with no error or missing node.
+fn only_mask_node_kinds(node: &Node, source: &str) -> bool {
+    if node.is_error() || node.is_missing() {
+        return false;
+    }
+    let listed = if node.is_named() {
+        MASK_NODE_KINDS.contains(&node.kind())
+    } else {
+        MASK_TOKEN_KINDS.contains(&node.kind())
+    };
+    if !listed {
+        return false;
+    }
+    // a bare word that the shell would expand (glob, brace, tilde) can become any flag or path
+    if matches!(node.kind(), "word" | "number") {
+        let t = node.utf8_text(source.as_bytes()).unwrap_or("*");
+        if t.contains(['*', '?', '[', ']', '{', '}', '~']) {
+            return false;
+        }
+    }
+    let mut cursor = node.walk();
+    let all = node
+        .children(&mut cursor)
+        .all(|c| only_mask_node_kinds(&c, source));
+    all
+}
+
+/// The text of a `word` node that has no quote, `$`, backtick or backslash in it, so the flag
+/// name is exactly what it reads as.
+fn plain_word_text<'a>(node: &Node, source: &'a str) -> Option<&'a str> {
+    if node.kind() != "word" {
+        return None;
+    }
+    let t = node.utf8_text(source.as_bytes()).ok()?;
+    (!t.contains(['"', '\'', '$', '`', '\\'])).then_some(t)
+}
+
+/// Push the masked ranges of the one command in `cmd`: its quoted-string arguments that are text.
+/// `cmd` has already passed the allowlist, so its arguments are only `word`, `raw_string` and
+/// `string` nodes with no expansion inside.
+fn push_data_ranges(cmd: &Node, source: &str, out: &mut Vec<Range<usize>>) {
+    if !is_data_command(cmd, source) {
+        return;
+    }
+    let mut cursor = cmd.walk();
+    let children: Vec<Node> = cmd.children(&mut cursor).collect();
+    let text_of = |n: &Node| n.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+    let program = children.first().map(text_of).unwrap_or_default();
+    for (i, arg) in children.iter().enumerate() {
+        if !matches!(arg.kind(), "string" | "raw_string") {
+            continue;
+        }
+        let Some(b) = i.checked_sub(1).map(|j| &children[j]) else {
+            continue;
+        };
+        // (a) the value of a plain-word flag in INLINE_TEXT_FLAGS is text for any data command
+        let inline_flag =
+            plain_word_text(b, source).is_some_and(|w| INLINE_TEXT_FLAGS.contains(&w));
+        if !inline_flag {
+            // (b) otherwise the value is POSITIONAL, and a positional word is text only where
+            // the command takes none but text: `echo`, `printf` and the `bd create` title.
+            // `fleetmail`, `fleet-ring`, `gh` and the other `bd` commands take subcommands,
+            // ids and file names there (`fleetmail foreign fence-check 'cat .env'`).
+            let positional_text = match program.as_str() {
+                "echo" | "printf" => true,
+                "bd" => i == 2 && text_of(&children[1]) == "create",
+                _ => false,
+            };
+            // a value right after ANY token that reads as a flag (`--body-file`,
+            // `'--body-file'`, `-F`) may be a PATH
+            let w: String = text_of(b)
+                .chars()
+                .filter(|c| !matches!(c, '"' | '\'' | '\\'))
+                .collect();
+            if !positional_text || w.starts_with('-') {
+                continue;
+            }
+        }
+        let text = text_of(arg);
+        // a quoted token that reads as a flag (`'--body-file=x'`) is not text either
+        let inner = text.trim_matches(|c| c == '"' || c == '\'');
+        if is_plain_text(&text) && !inner.starts_with('-') {
+            out.push(arg.byte_range());
+        }
+    }
+}
+
+/// Collect the ranges described on `CommandAnalysis::data_arg_ranges`.
+///
+/// Fail closed, and small on purpose: the mask applies only when the ENTIRE script is ONE
+/// simple data command and every node of its tree is on `MASK_NODE_KINDS`. That excludes, by
+/// construction, a second statement, a list, a pipeline, a subshell, a compound, a redirect of
+/// any kind (including every heredoc and herestring), a process or command substitution, an
+/// expansion, a concatenation and a comment. A denylist of "things that could rewire a later
+/// command" cannot be finished (`eval`, `read -r PATH`, `printf -v PATH`, ...); a lone command
+/// has no "later" and no "earlier".
+fn collect_data_arg_ranges(node: &Node, source: &str, out: &mut Vec<Range<usize>>) {
+    if node.kind() != "program" || node.child_count() != 1 || !only_mask_node_kinds(node, source) {
+        return;
+    }
+    if let Some(only) = node.child(0) {
+        if only.kind() == "command" {
+            push_data_ranges(&only, source, out);
+        }
+    }
+}
+
+/// `command` with each range replaced by a neutral token, for running text rules on the
+/// parts the AST did not prove to be data. Ranges come from tree-sitter, so they sit on char
+/// boundaries; overlapping or duplicate ranges are skipped.
+pub fn mask_ranges(command: &str, ranges: &[Range<usize>]) -> String {
+    let mut sorted: Vec<_> = ranges.to_vec();
+    sorted.sort_by_key(|r| (r.start, r.end));
+    let mut out = String::with_capacity(command.len());
+    let mut pos = 0;
+    for r in sorted {
+        if r.start < pos || r.end > command.len() {
+            continue;
+        }
+        out.push_str(&command[pos..r.start]);
+        out.push_str("data-arg-literal");
+        pos = r.end;
+    }
+    out.push_str(&command[pos..]);
+    out
 }
 
 /// Classify each pipeline node and accumulate flags. Source (remote-fetch) and
@@ -755,5 +999,51 @@ mod tests {
             analysis.has_pipe_to_interpreter,
             "xargs python should be detected as pipe to interpreter"
         );
+    }
+
+    #[test]
+    fn mask_is_granted_only_for_the_closed_node_kinds() {
+        let masked = |c: &str| !analyze_command(c).data_arg_ranges.is_empty();
+        for c in [
+            "echo 'hi there'",
+            "echo \"hi there\"",
+            "printf '%s' \"hi there\"",
+            "fleetmail send --to X --body 'hi there'",
+            "gh pr comment 1 --body 'hi there'",
+            "bd create 'a title' -d 'a note'",
+        ] {
+            assert!(masked(c), "should mask: {c}");
+        }
+        // one command per node kind (or token) outside MASK_NODE_KINDS: each switches the mask off
+        for (kind, c) in [
+            ("heredoc_redirect", "echo 'x' <<'EOF'\nbody\nEOF"),
+            ("herestring_redirect", "echo 'x' <<< 'y'"),
+            ("file_redirect", "echo 'x' > f"),
+            ("file_redirect", "echo 'x' < f"),
+            ("redirected_statement", "echo 'x' 2>&1"),
+            ("pipeline", "echo 'x' | cat"),
+            ("list", "echo 'x' && true"),
+            ("semicolon", "echo 'x'; true"),
+            ("background", "echo 'x' &"),
+            ("subshell", "(echo 'x')"),
+            ("compound_statement", "{ echo 'x'; }"),
+            ("negated_command", "! echo 'x'"),
+            ("variable_assignment", "X=1 echo 'x'"),
+            ("comment", "echo 'x' # c"),
+            ("concatenation", "echo 'x' a'b'"),
+            ("simple_expansion", "echo 'x' $X"),
+            ("expansion", "echo 'x' ${X}"),
+            ("command_substitution", "echo 'x' $(true)"),
+            ("backtick", "echo 'x' `true`"),
+            ("process_substitution", "echo 'x' <(true)"),
+            ("ansi_c_string", "echo 'x' $'y'"),
+            ("string_expansion", "echo 'x' \"a${X}b\""),
+            ("string_substitution", "echo 'x' \"a$(true)b\""),
+            ("glob", "echo 'x' *.txt"),
+            ("brace", "echo 'x' {a,b}"),
+            ("tilde", "echo 'x' ~/f"),
+        ] {
+            assert!(!masked(c), "{kind} must switch the mask off: {c}");
+        }
     }
 }

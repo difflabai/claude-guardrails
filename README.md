@@ -256,6 +256,49 @@ If guardrails blocks a legitimate command, you have three options:
 2. **Lower the safety level** — Switch from `strict` to `high` or `critical`
 3. **Audit mode** — Run with `GUARDRAILS_WARN_ONLY=1` to see what would be blocked without enforcement
 
+### Words in data are not commands
+
+The word-matching rules `curl-pipe-python`, `cat-env-file` and `cat-ssh-key` ignore the quoted
+arguments of one kind of command: a LONE data command. A mail body that merely mentions
+`curl | python3` is then not blocked.
+
+The mask is a closed allowlist on the parsed command. It applies only when the entire script is
+ONE simple command, that command is one of `fleetmail`, `fleet-ring`, `echo`, `printf`,
+`gh pr ...` / `gh issue ...` (the subcommand directly after `gh`) or
+`bd create|update|comment|comments|close|note` (directly after `bd`), and EVERY node of its
+syntax tree is of a kind on the `MASK_NODE_KINDS` list in `src/parser/ast.rs`: `program`,
+`command`, `command_name`, `word`, `number`, `raw_string`, `string`, `string_content` (plus the
+double-quote token of a `string`). Any other node kind anywhere means no mask at all, so the
+command gets the verdict it would get without this feature. That excludes by construction: a
+second statement, list, pipeline, subshell, group, comment, trailing `&`/`;`, prefix assignment,
+a redirect of ANY kind (including every heredoc and herestring), command or process
+substitution, any expansion, a concatenation (`cat'x'.env`), an ANSI-C string, and an error node.
+A bare word containing a glob, brace or tilde (`*`, `?`, `[`, `]`, `{`, `}`, `~`) also gets no
+mask. The command name must be bare (`echo`, not `./echo`, `/bin/echo` or `\echo`). A quoted
+string is masked only when its text has no `$(`, backtick, `<(`, `>(` and no backslash.
+
+A string's value is masked only when (a) the token before it is a plain word (no quote, `$`,
+backtick or backslash) in the inline-text flags (`--body`, `--title`, `-d`, `-m`, ...), which holds
+for every data command, or (b) it is POSITIONAL, and only `echo`, `printf` and the `bd create`
+title (the first positional after `create`) take positional text. For `fleetmail`, `fleet-ring`,
+`gh` and every other `bd` command a positional argument may be a subcommand, an id or a FILE
+(`fleetmail foreign fence-check 'cat .env'` opens its argument), so only the inline-flag values are
+masked. The value of `--body-file`, `-F`, any unknown flag, or a quoted flag name is never masked,
+and a quoted token that itself starts with `-` is never masked. The masked rules run on the masked
+text exactly as it is, and on its quote-normalised forms.
+
+This is deliberately narrow. A list of "things that could rewire a later command" cannot be
+finished (`eval`, `read -r`, `printf -v`, `alias`, functions, `exec`, `trap`, ...), and shape
+patches kept missing a layout; a lone command with a closed list of node kinds has neither an
+earlier or later statement nor an unlisted layout.
+
+Known false blocks (accepted): every heredoc (`fleetmail send --body-stdin <<'EOF' ...`; use
+`--body '...'`), every redirect, `true && echo "... cat .env ..."`, `cd /tmp && fleetmail send ...`,
+`set -e; echo "..."`, `echo "... cat .env ..." > notes.txt`, any compound command whose quoted
+text names a protected word; a body containing any backslash (`printf '...\n'`); `./echo`. Also a
+`cat <<EOF` heredoc naming `.env`. Not covered: text written to a file and run later, and shell
+history tricks (`fc -ln`).
+
 ## Architecture
 
 ```
