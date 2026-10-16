@@ -106,7 +106,7 @@ pub struct CommandAnalysis {
     /// short allowlist of data-carrying commands (echo, printf, fleetmail, ...), contain no
     /// executing substitution, and sit in the known-safe shape (top-level statement, no output
     /// redirect, last child of any pipeline). The text rules curl-pipe-python, cat-env-file and cat-ssh-key run with these
-    /// masked out (servitor-udq8). Anything not provably data stays visible to them.
+    /// masked out. Anything not provably data stays visible to them.
     pub data_arg_ranges: Vec<Range<usize>>,
     /// Raw AST parse succeeded
     pub parsed: bool,
