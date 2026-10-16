@@ -431,6 +431,27 @@ const DATA_COMMANDS: &[&str] = &["echo", "printf", "fleetmail", "fleet-ring", "b
 const GH_DATA_SUBCOMMANDS: &[&str] = &["pr", "issue"];
 const BD_DATA_SUBCOMMANDS: &[&str] = &["create", "update", "comment", "comments", "close", "note"];
 
+/// Flags whose following value is inline text (a body, title or message), not a file name.
+/// Allowlist: the value of any other flag is never masked.
+const INLINE_TEXT_FLAGS: &[&str] = &[
+    "--body",
+    "-b",
+    "--title",
+    "-t",
+    "--message",
+    "-m",
+    "--subject",
+    "--description",
+    "-d",
+    "--design",
+    "--acceptance",
+    "--notes",
+    "--note",
+    "--comment",
+    "--reason",
+    "--text",
+];
+
 /// True when `text` contains something the shell would execute while expanding it.
 fn has_executing_expansion(text: &str) -> bool {
     text.contains("$(") || text.contains('`') || text.contains("<(") || text.contains(">(")
@@ -449,7 +470,13 @@ fn is_data_command(cmd: &Node, source: &str) -> bool {
     if dynamic {
         return false;
     }
-    let base = name.rsplit('/').next().unwrap_or(&name);
+    // a BARE name only, taken from the SOURCE text (the normalised name drops the path):
+    // `./echo`, `/bin/echo` or `/tmp/x/echo` may be any executable
+    let raw = name_node.utf8_text(source.as_bytes()).unwrap_or("");
+    if raw != name {
+        return false;
+    }
+    let base = name.as_str();
     if !DATA_COMMANDS.contains(&base) {
         return false;
     }
@@ -481,6 +508,18 @@ fn is_input_only_redirect(redirect: &Node, source: &str) -> bool {
             t.starts_with('<') && !t.starts_with("<&") && !t.starts_with("<(")
         }
         _ => false,
+    }
+}
+
+/// True when the heredoc's delimiter word is quoted or backslash-escaped.
+fn heredoc_delimiter_quoted(redirect: &Node, source: &str) -> bool {
+    let mut cursor = redirect.walk();
+    let start = redirect
+        .children(&mut cursor)
+        .find(|c| c.kind() == "heredoc_start");
+    match start.and_then(|n| n.utf8_text(source.as_bytes()).ok()) {
+        Some(t) => t.contains(['\'', '"', '\\']),
+        None => false,
     }
 }
 
@@ -518,7 +557,19 @@ fn push_data_ranges(stmt: &Node, source: &str, out: &mut Vec<Range<usize>>) {
         return;
     }
     let mut cursor = cmd.walk();
+    let mut prev: Option<Node> = None;
     for arg in cmd.children(&mut cursor) {
+        let before = prev.replace(arg);
+        // the value of a flag is text only for the flags listed in INLINE_TEXT_FLAGS; the value
+        // of any other flag (`--body-file 'x'`, `-F 'x'`) may be a PATH
+        if let Some(b) = before {
+            if b.kind() == "word" {
+                let w = b.utf8_text(source.as_bytes()).unwrap_or("");
+                if w.starts_with('-') && !INLINE_TEXT_FLAGS.contains(&w) {
+                    continue;
+                }
+            }
+        }
         if matches!(arg.kind(), "string" | "raw_string") {
             if let Ok(text) = arg.utf8_text(source.as_bytes()) {
                 if !has_executing_expansion(text) {
@@ -528,6 +579,11 @@ fn push_data_ranges(stmt: &Node, source: &str, out: &mut Vec<Range<usize>>) {
         }
     }
     for redirect in redirects.iter().filter(|r| r.kind() == "heredoc_redirect") {
+        // Only a QUOTED delimiter (<<'EOF', <<"EOF", <<\EOF) means bash does no expansion in the
+        // body. An unquoted body joins backslash-newline and runs `$(...)` built across lines.
+        if !heredoc_delimiter_quoted(redirect, source) {
+            continue;
+        }
         let mut rc = redirect.walk();
         for part in redirect.children(&mut rc) {
             if part.kind() == "heredoc_body" {
