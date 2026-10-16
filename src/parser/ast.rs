@@ -569,36 +569,44 @@ fn push_data_ranges(cmd: &Node, source: &str, out: &mut Vec<Range<usize>>) {
         return;
     }
     let mut cursor = cmd.walk();
-    let mut prev: Option<Node> = None;
-    for arg in cmd.children(&mut cursor) {
-        let before = prev.replace(arg);
+    let children: Vec<Node> = cmd.children(&mut cursor).collect();
+    let text_of = |n: &Node| n.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+    let program = children.first().map(&text_of).unwrap_or_default();
+    for (i, arg) in children.iter().enumerate() {
         if !matches!(arg.kind(), "string" | "raw_string") {
             continue;
         }
-        if let Some(b) = before {
-            // (a) the value of a plain-word flag in INLINE_TEXT_FLAGS is text; (b) otherwise a
-            // value right after ANY token that reads as a flag (`--body-file`, `'--body-file'`,
-            // `-F`) may be a PATH, so only a positional value (no flag before it) is text
-            let inline_flag =
-                plain_word_text(&b, source).is_some_and(|w| INLINE_TEXT_FLAGS.contains(&w));
-            if !inline_flag {
-                let w: String = b
-                    .utf8_text(source.as_bytes())
-                    .unwrap_or("")
-                    .chars()
-                    .filter(|c| !matches!(c, '"' | '\'' | '\\'))
-                    .collect();
-                if w.starts_with('-') {
-                    continue;
-                }
+        let Some(b) = i.checked_sub(1).map(|j| &children[j]) else {
+            continue;
+        };
+        // (a) the value of a plain-word flag in INLINE_TEXT_FLAGS is text for any data command
+        let inline_flag =
+            plain_word_text(b, source).is_some_and(|w| INLINE_TEXT_FLAGS.contains(&w));
+        if !inline_flag {
+            // (b) otherwise the value is POSITIONAL, and a positional word is text only where
+            // the command takes none but text: `echo`, `printf` and the `bd create` title.
+            // `fleetmail`, `fleet-ring`, `gh` and the other `bd` commands take subcommands,
+            // ids and file names there (`fleetmail foreign fence-check 'cat .env'`).
+            let positional_text = match program.as_str() {
+                "echo" | "printf" => true,
+                "bd" => i == 2 && text_of(&children[1]) == "create",
+                _ => false,
+            };
+            // a value right after ANY token that reads as a flag (`--body-file`,
+            // `'--body-file'`, `-F`) may be a PATH
+            let w: String = text_of(b)
+                .chars()
+                .filter(|c| !matches!(c, '"' | '\'' | '\\'))
+                .collect();
+            if !positional_text || w.starts_with('-') {
+                continue;
             }
         }
-        if let Ok(text) = arg.utf8_text(source.as_bytes()) {
-            // a quoted token that reads as a flag (`'--body-file=x'`) is not text either
-            let inner = text.trim_matches(|c| c == '"' || c == '\'');
-            if is_plain_text(text) && !inner.starts_with('-') {
-                out.push(arg.byte_range());
-            }
+        let text = text_of(arg);
+        // a quoted token that reads as a flag (`'--body-file=x'`) is not text either
+        let inner = text.trim_matches(|c| c == '"' || c == '\'');
+        if is_plain_text(&text) && !inner.starts_with('-') {
+            out.push(arg.byte_range());
         }
     }
 }

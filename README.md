@@ -278,11 +278,14 @@ mask. The command name must be bare (`echo`, not `./echo`, `/bin/echo` or `\echo
 string is masked only when its text has no `$(`, backtick, `<(`, `>(` and no backslash.
 
 A string's value is masked only when (a) the token before it is a plain word (no quote, `$`,
-backtick or backslash) in the inline-text flags (`--body`, `--title`, `-d`, `-m`, ...), or
-(b) it is positional: it does not follow any token that starts with `-`, quotes removed. The value
-of `--body-file`, `-F`, any unknown flag, or a quoted flag name is never masked, and a quoted
-token that itself starts with `-` is never masked. The masked rules run on the masked text exactly
-as it is, and on its quote-normalised forms.
+backtick or backslash) in the inline-text flags (`--body`, `--title`, `-d`, `-m`, ...), which holds
+for every data command, or (b) it is POSITIONAL, and only `echo`, `printf` and the `bd create`
+title (the first positional after `create`) take positional text. For `fleetmail`, `fleet-ring`,
+`gh` and every other `bd` command a positional argument may be a subcommand, an id or a FILE
+(`fleetmail foreign fence-check 'cat .env'` opens its argument), so only the inline-flag values are
+masked. The value of `--body-file`, `-F`, any unknown flag, or a quoted flag name is never masked,
+and a quoted token that itself starts with `-` is never masked. The masked rules run on the masked
+text exactly as it is, and on its quote-normalised forms.
 
 This is deliberately narrow. A list of "things that could rewire a later command" cannot be
 finished (`eval`, `read -r`, `printf -v`, `alias`, functions, `exec`, `trap`, ...), and shape
