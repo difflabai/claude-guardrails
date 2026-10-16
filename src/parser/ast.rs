@@ -571,7 +571,7 @@ fn push_data_ranges(cmd: &Node, source: &str, out: &mut Vec<Range<usize>>) {
     let mut cursor = cmd.walk();
     let children: Vec<Node> = cmd.children(&mut cursor).collect();
     let text_of = |n: &Node| n.utf8_text(source.as_bytes()).unwrap_or("").to_string();
-    let program = children.first().map(&text_of).unwrap_or_default();
+    let program = children.first().map(text_of).unwrap_or_default();
     for (i, arg) in children.iter().enumerate() {
         if !matches!(arg.kind(), "string" | "raw_string") {
             continue;
