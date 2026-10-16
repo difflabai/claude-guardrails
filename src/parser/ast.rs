@@ -457,6 +457,14 @@ fn has_executing_expansion(text: &str) -> bool {
     text.contains("$(") || text.contains('`') || text.contains("<(") || text.contains(">(")
 }
 
+/// A range is masked only if it is plain text. Any BACKSLASH disqualifies it: bash removes
+/// backslash-newline before it parses an expansion, so `"x$\<NL>(cmd)"` runs `cmd` while the
+/// literal text shows no `$(`. Refusing every backslash closes that whole escape class; such a
+/// body is an accepted false block (base behaviour).
+fn is_plain_text(text: &str) -> bool {
+    !has_executing_expansion(text) && !text.contains('\\')
+}
+
 /// A `command` node that is a data-carrying command in its safe form (see constants above).
 fn is_data_command(cmd: &Node, source: &str) -> bool {
     let mut cursor = cmd.walk();
@@ -563,16 +571,23 @@ fn push_data_ranges(stmt: &Node, source: &str, out: &mut Vec<Range<usize>>) {
         // the value of a flag is text only for the flags listed in INLINE_TEXT_FLAGS; the value
         // of any other flag (`--body-file 'x'`, `-F 'x'`) may be a PATH
         if let Some(b) = before {
-            if b.kind() == "word" {
-                let w = b.utf8_text(source.as_bytes()).unwrap_or("");
-                if w.starts_with('-') && !INLINE_TEXT_FLAGS.contains(&w) {
-                    continue;
-                }
+            // the previous token's TEXT with quotes removed, whatever its node kind:
+            // `'--body-file'`, `"--body-file"` and `--body-''file` are all the flag --body-file
+            let w: String = b
+                .utf8_text(source.as_bytes())
+                .unwrap_or("")
+                .chars()
+                .filter(|c| !matches!(c, '"' | '\'' | '\\'))
+                .collect();
+            if w.starts_with('-') && !INLINE_TEXT_FLAGS.contains(&w.as_str()) {
+                continue;
             }
         }
         if matches!(arg.kind(), "string" | "raw_string") {
             if let Ok(text) = arg.utf8_text(source.as_bytes()) {
-                if !has_executing_expansion(text) {
+                // a quoted token that reads as a flag (`'--body-file=x'`) is not text either
+                let inner = text.trim_matches(|c| c == '"' || c == '\'');
+                if is_plain_text(text) && !inner.starts_with('-') {
                     out.push(arg.byte_range());
                 }
             }
@@ -588,7 +603,7 @@ fn push_data_ranges(stmt: &Node, source: &str, out: &mut Vec<Range<usize>>) {
         for part in redirect.children(&mut rc) {
             if part.kind() == "heredoc_body" {
                 if let Ok(text) = part.utf8_text(source.as_bytes()) {
-                    if !has_executing_expansion(text) {
+                    if is_plain_text(text) {
                         out.push(part.byte_range());
                     }
                 }

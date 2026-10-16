@@ -267,8 +267,15 @@ The mask applies only when the entire script is ONE simple command, and that com
 after `gh`) or `bd create|update|comment|comments|close|note` (directly after `bd`). It has no
 prefix assignment (`FOO=bar fleetmail ...`), no output redirect of any kind (stdin redirects and
 heredocs are fine), and nothing before or after it: no second statement or line, pipeline, list,
-subshell, group, comment or trailing `&`/`;`. The quoted text must contain no `$(`, backtick,
-`<(` or `>(`. Anything else gets no mask and behaves as without this feature.
+subshell, group, comment or trailing `&`/`;`. The command name must be bare (`echo`, not
+`./echo`, `/bin/echo` or `\echo`). The quoted text must contain no `$(`, backtick, `<(` or `>(`
+and NO BACKSLASH at all: bash deletes backslash-newline before it parses an expansion, so
+`"x$\<NL>(cmd)"` runs `cmd` while the text shows no `$(`. Heredoc bodies are masked only when
+the delimiter is quoted (`<<'EOF'`); an unquoted body is expanded by bash. A string that is the
+value of a flag is masked only for the inline-text flags (`--body`, `--title`, `-d`, `-m`, ...),
+never for `--body-file`, `-F` or unknown flags, whose value may be a file name; a quoted token
+that itself starts with `-` is never masked. Anything else gets no mask, and every rule then
+runs on the raw text exactly as without this feature.
 
 This is deliberately narrow. A list of "things that could rewire a later command" cannot be
 finished (`eval`, `read -r`, `printf -v`, `alias`, functions, `exec`, `trap`, ...), so a lone
@@ -276,7 +283,8 @@ command, which has no earlier or later statement, is the only shape trusted.
 
 Known false blocks (accepted): `true && echo "... cat .env ..."`, `cd /tmp && fleetmail send ...`,
 `set -e; echo "..."`, `echo "... cat .env ..." > notes.txt`, and any compound command whose
-quoted text names a protected word. Also a `cat <<EOF` heredoc naming `.env`. Not covered: text
+quoted text names a protected word; a body containing any backslash (`printf '...\n'`); an
+unquoted heredoc body; `./echo`. Also a `cat <<EOF` heredoc naming `.env`. Not covered: text
 written to a file and run later, and shell history tricks (`fc -ln`).
 
 ## Architecture
