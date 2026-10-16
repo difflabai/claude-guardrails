@@ -1,4 +1,4 @@
-//! Reader commands pointed at protected secret paths (servitor-w8ys)
+//! Reader commands pointed at protected secret paths
 //!
 //! The regex rules only ever caught `cat .env` / `cat ~/.ssh/id_rsa`; `grep -r`, `head`,
 //! `tail`, `rg`, `less`, `awk`, `sed` … and `cat` of `*.pem` / `secrets.json` went

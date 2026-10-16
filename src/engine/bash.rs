@@ -15,7 +15,7 @@ use crate::rules::secret_read;
 
 use regex::RegexSet;
 
-/// `secret-read` (servitor-w8ys): a reader command whose own arguments name a protected
+/// `secret-read`: a reader command whose own arguments name a protected
 /// secret path. Token-based, so the same filenames in another command's quoted data
 /// argument (a mail --body) do not match. Honours the `secrets.files` pack switch.
 fn secret_read_decision(text: &str, config: &Config) -> Option<Decision> {
@@ -816,7 +816,7 @@ mod tests {
         assert!(decision.is_deny(), "env bash pipe should be caught");
     }
 
-    // ---- secret-path readers (servitor-w8ys) ----------------------------------------
+    // ---- secret-path readers ----------------------------------------
 
     fn allowed(command: &str) -> bool {
         let config = test_config();
@@ -902,7 +902,7 @@ mod tests {
             "sed -i.bak 's/a/b/' notes.txt",
             "rg -g '*.rs' KEY",
             "jq --arg a .env . data.json",
-            "wc -l <<EOF\nsee .env and head .env\nEOF", // (the older cat-env-file regex, not this rule, still reads a cat heredoc as a read; servitor-udq8)
+            "wc -l <<EOF\nsee .env and head .env\nEOF", // (the older cat-env-file regex, not this rule, still reads a cat heredoc as a read)
             "fleetmail send --to X --body-stdin <<'EOF'\nhead .env\nread server.pem\nEOF",
             "grep credentials README.md",
             "cat notes.txt",
