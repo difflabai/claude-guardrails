@@ -505,123 +505,99 @@ fn is_data_command(cmd: &Node, source: &str) -> bool {
     }
 }
 
-/// True for a redirect that only feeds STDIN (`<`, `<<`, `<<-`, `<<<`). Every other redirect,
-/// output or descriptor-duplicating, could send the data somewhere that runs it.
-fn is_input_only_redirect(redirect: &Node, source: &str) -> bool {
-    match redirect.kind() {
-        "heredoc_redirect" | "herestring_redirect" => true,
-        "file_redirect" => {
-            let text = redirect.utf8_text(source.as_bytes()).unwrap_or(">");
-            let t = text.trim_start_matches(|c: char| c.is_ascii_digit());
-            t.starts_with('<') && !t.starts_with("<&") && !t.starts_with("<(")
-        }
-        _ => false,
+/// The CLOSED allowlist of tree-sitter node kinds a masked command may contain. The mask is
+/// granted only when EVERY node in the whole tree is one of these (or an allowed token), so a
+/// shape nobody thought of (a redirect, a heredoc, a substitution, a concatenation, a pipeline
+/// nested where the grammar puts it) carries a kind that is not listed and gets no mask: the
+/// base verdict. Reviewing the mask means reviewing this one list.
+const MASK_NODE_KINDS: &[&str] = &[
+    "program",
+    "command",
+    "command_name",
+    "word",
+    "number",
+    "raw_string",
+    "string",
+    "string_content",
+];
+
+/// Anonymous tokens the mask accepts: the double quote that delimits a `string`.
+const MASK_TOKEN_KINDS: &[&str] = &["\""];
+
+/// True when `node` and every node below it is on the allowlist, with no error or missing node.
+fn only_mask_node_kinds(node: &Node, source: &str) -> bool {
+    if node.is_error() || node.is_missing() {
+        return false;
     }
-}
-
-/// The heredoc delimiter WORD when, and only when, its source text is exactly one simple word
-/// fully wrapped in one pair of matching quotes: `'EOF'` or `"EOF"`. Mixed quoting (`E"OF"`),
-/// `$'EOF'`, a backslash, an empty word or partial quotes return None: tree-sitter reads such a
-/// delimiter literally while bash strips the quoting and ends the body at the bare word, so the
-/// two can disagree about where the body stops.
-fn simple_quoted_delimiter<'a>(redirect: &Node, source: &'a str) -> Option<&'a str> {
-    let mut cursor = redirect.walk();
-    let start = redirect
-        .children(&mut cursor)
-        .find(|c| c.kind() == "heredoc_start")?;
-    let t = start.utf8_text(source.as_bytes()).ok()?;
-    let inner = t
-        .strip_prefix('\'')
-        .and_then(|r| r.strip_suffix('\''))
-        .or_else(|| t.strip_prefix('"').and_then(|r| r.strip_suffix('"')))?;
-    let simple = !inner.is_empty() && inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-    simple.then_some(inner)
-}
-
-/// True when some body line, with leading spaces/tabs and a trailing CR removed, equals the
-/// delimiter word: bash could end the heredoc there while tree-sitter does not, so refuse.
-fn body_has_terminator_line(body: &str, word: &str) -> bool {
-    body.lines()
-        .any(|l| l.trim_start_matches([' ', '\t']).trim_end_matches('\r') == word)
-}
-
-/// Push the masked ranges of one safe data statement: the quoted-string arguments of `cmd` and,
-/// for `redirected_statement`, the bodies of the heredocs that feed it.
-fn push_data_ranges(stmt: &Node, source: &str, out: &mut Vec<Range<usize>>) {
-    let (cmd, redirects): (Node, Vec<Node>) = if stmt.kind() == "redirected_statement" {
-        let mut cursor = stmt.walk();
-        let children: Vec<Node> = stmt.children(&mut cursor).collect();
-        let Some(body) = children.iter().find(|c| c.kind() == "command") else {
-            return;
-        };
-        let body = *body;
-        let redirects: Vec<Node> = children
-            .into_iter()
-            .filter(|c| !matches!(c.kind(), "command") && c.is_named() && c.id() != body.id())
-            .collect();
-        // ANY redirect that is not input-only means the data may go somewhere else: no mask.
-        if !redirects.iter().all(|r| is_input_only_redirect(r, source)) {
-            return;
-        }
-        (body, redirects)
+    let listed = if node.is_named() {
+        MASK_NODE_KINDS.contains(&node.kind())
     } else {
-        (*stmt, Vec::new())
+        MASK_TOKEN_KINDS.contains(&node.kind())
     };
-    if !is_data_command(&cmd, source) {
-        return;
+    if !listed {
+        return false;
     }
-    let mut cursor = cmd.walk();
-    // no prefix assignments (`FOO=bar fleetmail ...`): not the plain shape
-    if cmd
+    // a bare word that the shell would expand (glob, brace, tilde) can become any flag or path
+    if matches!(node.kind(), "word" | "number") {
+        let t = node.utf8_text(source.as_bytes()).unwrap_or("*");
+        if t.contains(['*', '?', '[', ']', '{', '}', '~']) {
+            return false;
+        }
+    }
+    let mut cursor = node.walk();
+    let all = node
         .children(&mut cursor)
-        .any(|c| c.kind() == "variable_assignment")
-    {
+        .all(|c| only_mask_node_kinds(&c, source));
+    all
+}
+
+/// The text of a `word` node that has no quote, `$`, backtick or backslash in it, so the flag
+/// name is exactly what it reads as.
+fn plain_word_text<'a>(node: &Node, source: &'a str) -> Option<&'a str> {
+    if node.kind() != "word" {
+        return None;
+    }
+    let t = node.utf8_text(source.as_bytes()).ok()?;
+    (!t.contains(['"', '\'', '$', '`', '\\'])).then_some(t)
+}
+
+/// Push the masked ranges of the one command in `cmd`: its quoted-string arguments that are text.
+/// `cmd` has already passed the allowlist, so its arguments are only `word`, `raw_string` and
+/// `string` nodes with no expansion inside.
+fn push_data_ranges(cmd: &Node, source: &str, out: &mut Vec<Range<usize>>) {
+    if !is_data_command(cmd, source) {
         return;
     }
     let mut cursor = cmd.walk();
     let mut prev: Option<Node> = None;
     for arg in cmd.children(&mut cursor) {
         let before = prev.replace(arg);
-        // the value of a flag is text only for the flags listed in INLINE_TEXT_FLAGS; the value
-        // of any other flag (`--body-file 'x'`, `-F 'x'`) may be a PATH
-        if let Some(b) = before {
-            // the previous token's TEXT with quotes removed, whatever its node kind:
-            // `'--body-file'`, `"--body-file"` and `--body-''file` are all the flag --body-file
-            let w: String = b
-                .utf8_text(source.as_bytes())
-                .unwrap_or("")
-                .chars()
-                .filter(|c| !matches!(c, '"' | '\'' | '\\'))
-                .collect();
-            // a `$` in the token (`$F`, `$'--body-file'`, `${F:---body-file}`) may build a flag
-            if (w.starts_with('-') && !INLINE_TEXT_FLAGS.contains(&w.as_str())) || w.contains('$') {
-                continue;
-            }
-        }
-        if matches!(arg.kind(), "string" | "raw_string") {
-            if let Ok(text) = arg.utf8_text(source.as_bytes()) {
-                // a quoted token that reads as a flag (`'--body-file=x'`) is not text either
-                let inner = text.trim_matches(|c| c == '"' || c == '\'');
-                if is_plain_text(text) && !inner.starts_with('-') {
-                    out.push(arg.byte_range());
-                }
-            }
-        }
-    }
-    for redirect in redirects.iter().filter(|r| r.kind() == "heredoc_redirect") {
-        // Only ONE fully quoted simple delimiter (<<'EOF' or <<"EOF") means bash does no
-        // expansion in the body AND reads the same delimiter word tree-sitter does.
-        let Some(word) = simple_quoted_delimiter(redirect, source) else {
+        if !matches!(arg.kind(), "string" | "raw_string") {
             continue;
-        };
-        let mut rc = redirect.walk();
-        for part in redirect.children(&mut rc) {
-            if part.kind() == "heredoc_body" {
-                if let Ok(text) = part.utf8_text(source.as_bytes()) {
-                    if is_plain_text(text) && !body_has_terminator_line(text, word) {
-                        out.push(part.byte_range());
-                    }
+        }
+        if let Some(b) = before {
+            // (a) the value of a plain-word flag in INLINE_TEXT_FLAGS is text; (b) otherwise a
+            // value right after ANY token that reads as a flag (`--body-file`, `'--body-file'`,
+            // `-F`) may be a PATH, so only a positional value (no flag before it) is text
+            let inline_flag =
+                plain_word_text(&b, source).is_some_and(|w| INLINE_TEXT_FLAGS.contains(&w));
+            if !inline_flag {
+                let w: String = b
+                    .utf8_text(source.as_bytes())
+                    .unwrap_or("")
+                    .chars()
+                    .filter(|c| !matches!(c, '"' | '\'' | '\\'))
+                    .collect();
+                if w.starts_with('-') {
+                    continue;
                 }
+            }
+        }
+        if let Ok(text) = arg.utf8_text(source.as_bytes()) {
+            // a quoted token that reads as a flag (`'--body-file=x'`) is not text either
+            let inner = text.trim_matches(|c| c == '"' || c == '\'');
+            if is_plain_text(text) && !inner.starts_with('-') {
+                out.push(arg.byte_range());
             }
         }
     }
@@ -629,18 +605,19 @@ fn push_data_ranges(stmt: &Node, source: &str, out: &mut Vec<Range<usize>>) {
 
 /// Collect the ranges described on `CommandAnalysis::data_arg_ranges`.
 ///
-/// Fail closed, and small on purpose: the mask applies only when the ENTIRE script is ONE simple
-/// data command (optionally with stdin redirects and heredocs). Anything else (a second
-/// statement, a pipeline, a list, a subshell, a group, a comment, a trailing `&` or `;`) gets no
-/// mask and behaves as the base does. A denylist of "things that could rewire a later command"
-/// cannot be finished (`eval`, `read -r PATH`, `printf -v PATH`, ...); a lone command has no
-/// "later" and no "earlier".
+/// Fail closed, and small on purpose: the mask applies only when the ENTIRE script is ONE
+/// simple data command and every node of its tree is on `MASK_NODE_KINDS`. That excludes, by
+/// construction, a second statement, a list, a pipeline, a subshell, a compound, a redirect of
+/// any kind (including every heredoc and herestring), a process or command substitution, an
+/// expansion, a concatenation and a comment. A denylist of "things that could rewire a later
+/// command" cannot be finished (`eval`, `read -r PATH`, `printf -v PATH`, ...); a lone command
+/// has no "later" and no "earlier".
 fn collect_data_arg_ranges(node: &Node, source: &str, out: &mut Vec<Range<usize>>) {
-    if node.kind() != "program" || node.child_count() != 1 {
+    if node.kind() != "program" || node.child_count() != 1 || !only_mask_node_kinds(node, source) {
         return;
     }
     if let Some(only) = node.child(0) {
-        if matches!(only.kind(), "command" | "redirected_statement") {
+        if only.kind() == "command" {
             push_data_ranges(&only, source, out);
         }
     }
@@ -1017,29 +994,48 @@ mod tests {
     }
 
     #[test]
-    fn heredoc_terminator_line_check() {
-        // bash may end a heredoc at a line tree-sitter keeps in the body: refuse to mask then
-        assert!(body_has_terminator_line("a\nEOF\nb", "EOF"));
-        assert!(body_has_terminator_line("a\n  EOF\nb", "EOF"));
-        assert!(body_has_terminator_line("a\n\tEOF\nb", "EOF"));
-        assert!(body_has_terminator_line("a\nEOF\r\nb", "EOF"));
-        assert!(!body_has_terminator_line("a\nEOF x\nb", "EOF"));
-        assert!(!body_has_terminator_line("a\nmy EOF\nb", "EOF"));
-        assert!(!body_has_terminator_line("a\nb", "EOF"));
-    }
-
-    #[test]
-    fn heredoc_only_one_fully_quoted_simple_delimiter_is_masked() {
+    fn mask_is_granted_only_for_the_closed_node_kinds() {
         let masked = |c: &str| !analyze_command(c).data_arg_ranges.is_empty();
-        for d in ["'EOF'", "\"EOF\""] {
-            let c = format!("fleetmail send --body-stdin <<{d}\nwe saw words\nEOF");
-            assert!(masked(&c), "should mask: {c}");
-        }
-        for d in [
-            "EOF", "E\"OF\"", "$'EOF'", "E'OF'", "E\\OF", "\"E\"OF", "E'O'F",
+        for c in [
+            "echo 'hi there'",
+            "echo \"hi there\"",
+            "printf '%s' \"hi there\"",
+            "fleetmail send --to X --body 'hi there'",
+            "gh pr comment 1 --body 'hi there'",
+            "bd create 'a title' -d 'a note'",
         ] {
-            let c = format!("fleetmail send --body-stdin <<{d}\nwe saw words\nEOF");
-            assert!(!masked(&c), "must not mask: {c}");
+            assert!(masked(c), "should mask: {c}");
+        }
+        // one command per node kind (or token) outside MASK_NODE_KINDS: each switches the mask off
+        for (kind, c) in [
+            ("heredoc_redirect", "echo 'x' <<'EOF'\nbody\nEOF"),
+            ("herestring_redirect", "echo 'x' <<< 'y'"),
+            ("file_redirect", "echo 'x' > f"),
+            ("file_redirect", "echo 'x' < f"),
+            ("redirected_statement", "echo 'x' 2>&1"),
+            ("pipeline", "echo 'x' | cat"),
+            ("list", "echo 'x' && true"),
+            ("semicolon", "echo 'x'; true"),
+            ("background", "echo 'x' &"),
+            ("subshell", "(echo 'x')"),
+            ("compound_statement", "{ echo 'x'; }"),
+            ("negated_command", "! echo 'x'"),
+            ("variable_assignment", "X=1 echo 'x'"),
+            ("comment", "echo 'x' # c"),
+            ("concatenation", "echo 'x' a'b'"),
+            ("simple_expansion", "echo 'x' $X"),
+            ("expansion", "echo 'x' ${X}"),
+            ("command_substitution", "echo 'x' $(true)"),
+            ("backtick", "echo 'x' `true`"),
+            ("process_substitution", "echo 'x' <(true)"),
+            ("ansi_c_string", "echo 'x' $'y'"),
+            ("string_expansion", "echo 'x' \"a${X}b\""),
+            ("string_substitution", "echo 'x' \"a$(true)b\""),
+            ("glob", "echo 'x' *.txt"),
+            ("brace", "echo 'x' {a,b}"),
+            ("tilde", "echo 'x' ~/f"),
+        ] {
+            assert!(!masked(c), "{kind} must switch the mask off: {c}");
         }
     }
 }

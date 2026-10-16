@@ -259,39 +259,42 @@ If guardrails blocks a legitimate command, you have three options:
 ### Words in data are not commands
 
 The word-matching rules `curl-pipe-python`, `cat-env-file` and `cat-ssh-key` ignore the quoted
-arguments and heredoc bodies of one kind of command: a LONE data command. A mail body that
-merely mentions `curl | python3` is then not blocked.
+arguments of one kind of command: a LONE data command. A mail body that merely mentions
+`curl | python3` is then not blocked.
 
-The mask applies only when the entire script is ONE simple command, and that command is one of
-`fleetmail`, `fleet-ring`, `echo`, `printf`, `gh pr ...` / `gh issue ...` (the subcommand directly
-after `gh`) or `bd create|update|comment|comments|close|note` (directly after `bd`). It has no
-prefix assignment (`FOO=bar fleetmail ...`), no output redirect of any kind (stdin redirects and
-heredocs are fine), and nothing before or after it: no second statement or line, pipeline, list,
-subshell, group, comment or trailing `&`/`;`. The command name must be bare (`echo`, not
-`./echo`, `/bin/echo` or `\echo`). The quoted text must contain no `$(`, backtick, `<(` or `>(`
-and NO BACKSLASH at all: bash deletes backslash-newline before it parses an expansion, so
-`"x$\<NL>(cmd)"` runs `cmd` while the text shows no `$(`. Heredoc bodies are masked only when
-the delimiter is exactly one simple word (letters, digits, `_`) fully wrapped in one pair of
-matching quotes (`<<'EOF'` or `<<"EOF"`) and no body line equals that word (after trimming
-leading spaces/tabs and a trailing CR). Mixed quoting (`E"OF"`), `$'EOF'` and a backslash are
-never masked: tree-sitter reads such a delimiter literally while bash strips the quoting and ends
-the body at the bare word, so the two can disagree about where the body stops. An unquoted body
-is expanded by bash. A string that is the
-value of a flag is masked only for the inline-text flags (`--body`, `--title`, `-d`, `-m`, ...),
-never for `--body-file`, `-F`, unknown flags, or a flag name containing `$` (it may build a
-flag), whose value may be a file name; a quoted token
-that itself starts with `-` is never masked. Anything else gets no mask, and every rule then
-runs on the raw text exactly as without this feature.
+The mask is a closed allowlist on the parsed command. It applies only when the entire script is
+ONE simple command, that command is one of `fleetmail`, `fleet-ring`, `echo`, `printf`,
+`gh pr ...` / `gh issue ...` (the subcommand directly after `gh`) or
+`bd create|update|comment|comments|close|note` (directly after `bd`), and EVERY node of its
+syntax tree is of a kind on the `MASK_NODE_KINDS` list in `src/parser/ast.rs`: `program`,
+`command`, `command_name`, `word`, `number`, `raw_string`, `string`, `string_content` (plus the
+double-quote token of a `string`). Any other node kind anywhere means no mask at all, so the
+command gets the verdict it would get without this feature. That excludes by construction: a
+second statement, list, pipeline, subshell, group, comment, trailing `&`/`;`, prefix assignment,
+a redirect of ANY kind (including every heredoc and herestring), command or process
+substitution, any expansion, a concatenation (`cat'x'.env`), an ANSI-C string, and an error node.
+A bare word containing a glob, brace or tilde (`*`, `?`, `[`, `]`, `{`, `}`, `~`) also gets no
+mask. The command name must be bare (`echo`, not `./echo`, `/bin/echo` or `\echo`). A quoted
+string is masked only when its text has no `$(`, backtick, `<(`, `>(` and no backslash.
+
+A string's value is masked only when (a) the token before it is a plain word (no quote, `$`,
+backtick or backslash) in the inline-text flags (`--body`, `--title`, `-d`, `-m`, ...), or
+(b) it is positional: it does not follow any token that starts with `-`, quotes removed. The value
+of `--body-file`, `-F`, any unknown flag, or a quoted flag name is never masked, and a quoted
+token that itself starts with `-` is never masked. The masked rules run on the masked text exactly
+as it is, and on its quote-normalised forms.
 
 This is deliberately narrow. A list of "things that could rewire a later command" cannot be
-finished (`eval`, `read -r`, `printf -v`, `alias`, functions, `exec`, `trap`, ...), so a lone
-command, which has no earlier or later statement, is the only shape trusted.
+finished (`eval`, `read -r`, `printf -v`, `alias`, functions, `exec`, `trap`, ...), and shape
+patches kept missing a layout; a lone command with a closed list of node kinds has neither an
+earlier or later statement nor an unlisted layout.
 
-Known false blocks (accepted): `true && echo "... cat .env ..."`, `cd /tmp && fleetmail send ...`,
-`set -e; echo "..."`, `echo "... cat .env ..." > notes.txt`, and any compound command whose
-quoted text names a protected word; a body containing any backslash (`printf '...\n'`); an
-unquoted heredoc body; `./echo`. Also a `cat <<EOF` heredoc naming `.env`. Not covered: text
-written to a file and run later, and shell history tricks (`fc -ln`).
+Known false blocks (accepted): every heredoc (`fleetmail send --body-stdin <<'EOF' ...`; use
+`--body '...'`), every redirect, `true && echo "... cat .env ..."`, `cd /tmp && fleetmail send ...`,
+`set -e; echo "..."`, `echo "... cat .env ..." > notes.txt`, any compound command whose quoted
+text names a protected word; a body containing any backslash (`printf '...\n'`); `./echo`. Also a
+`cat <<EOF` heredoc naming `.env`. Not covered: text written to a file and run later, and shell
+history tricks (`fc -ln`).
 
 ## Architecture
 
