@@ -10,8 +10,20 @@ use crate::parser::ast;
 use crate::parser::{shell, wrapper};
 use crate::rules::dangerous;
 use crate::rules::exfiltration;
+use crate::rules::packs;
+use crate::rules::secret_read;
 
 use regex::RegexSet;
+
+/// `secret-read`: a reader command whose own arguments name a protected
+/// secret path. Token-based, so the same filenames in another command's quoted data
+/// argument (a mail --body) do not match. Honours the `secrets.files` pack switch.
+fn secret_read_decision(text: &str, config: &Config) -> Option<Decision> {
+    if packs::is_disabled(packs::pack_of("secret-read"), &config.packs.disabled) {
+        return None;
+    }
+    secret_read::command_reason(text).map(|reason| Decision::deny("secret-read", reason))
+}
 
 /// Check a bash command for security issues using AST-based analysis
 pub fn check_command(
@@ -74,6 +86,10 @@ pub fn check_command(
         // and arguments together
         let check_str = &cmd.full_command;
 
+        if let Some(decision) = secret_read_decision(check_str, config) {
+            return decision;
+        }
+
         // Also try wrapper unwrapping on the full command
         let unwrapped = wrapper::unwrap_command(check_str, &config.bash.wrappers);
 
@@ -106,6 +122,12 @@ pub fn check_command(
         {
             return decision;
         }
+    }
+
+    // 6b. Secret-path readers on the whole command: the splitter in secret_read is
+    // quote-aware and heredoc-aware, unlike split_compound_command below.
+    if let Some(decision) = secret_read_decision(command, config) {
+        return decision;
     }
 
     // 7. Also check the raw command for patterns the AST might miss
@@ -172,6 +194,10 @@ fn check_command_fallback(
     // Check for environment hijacking
     if shell::has_env_hijacking(command) {
         return Decision::deny("env-hijacking", "Environment variable hijacking detected");
+    }
+
+    if let Some(decision) = secret_read_decision(command, config) {
+        return decision;
     }
 
     // Split compound commands and check each part
@@ -788,5 +814,113 @@ mod tests {
             &exfil_rules,
         );
         assert!(decision.is_deny(), "env bash pipe should be caught");
+    }
+
+    // ---- secret-path readers ----------------------------------------
+
+    fn allowed(command: &str) -> bool {
+        let config = test_config();
+        let (bash_rules, exfil_rules) = compile_rules(SafetyLevel::High);
+        check_command(
+            command,
+            &config,
+            SafetyLevel::High,
+            &bash_rules,
+            &exfil_rules,
+        )
+        .is_allow()
+    }
+
+    #[test]
+    fn test_w8ys_any_reader_of_a_protected_path_blocks() {
+        for c in [
+            "cat .env",
+            "grep -r API_KEY .env",
+            "grep -rn TOKEN ~/work/.env.production",
+            "head -5 ~/.ssh/id_rsa",
+            "tail -n 3 ~/.ssh/id_ed25519",
+            "rg secret ~/.aws/credentials",
+            "less certs/server.pem",
+            "cat server.key",
+            "cat config/secrets.json",
+            "awk '{print}' secrets.yaml",
+            "sed -n 1p .env",
+            "cat *.pem",
+            "cat < .env",
+            "true && cat .env",
+            "ls | grep foo; tail ~/.aws/credentials",
+            "bash -c 'cat .env'",
+            "sh -c 'grep -r K ~/.aws/credentials'",
+            "env FOO=1 head ~/.ssh/id_rsa",
+            "jq --rawfile x .env .",
+            "sed -f.env x.txt",
+            "diff --from-file=.env x",
+            "sort --files0-from=.env",
+            "awk -i .env 1 x",
+            "grep -f.env KEY",
+            "grep --exclude-from=.env KEY README.md",
+            "rg --ignore-file=.env KEY .",
+            "ag -p .env KEY",
+            "rsync --exclude-from=.env . /tmp/b",
+            "wc --files0-from=.env",
+            "jq --slurpfile x secrets.json .",
+            "jq -e . .env",
+            "grep --color KEY .env",
+            "sort -s .env",
+            "nice head .env",
+            "nice -n 5 head .env",
+            "timeout 5 head .env",
+            "timeout -k 2 5 tail ~/.ssh/id_rsa",
+            "stdbuf -oL grep K .env",
+            "ionice -c 3 head .env",
+            "sh <<EOF\nhead .env\nEOF",
+            "git commit -m ok && head .env",
+            "echo 'a; b' && head .env",
+            "fleetmail send --body hi && head ~/.ssh/id_rsa",
+        ] {
+            assert!(!allowed(c), "must BLOCK: {c}");
+        }
+    }
+
+    #[test]
+    fn test_w8ys_multibyte_option_in_compound_does_not_hide_later_rules() {
+        // a short option with a multi-byte second char used to panic (abort = no output = allow)
+        for c in [
+            "grep -é KEY README.md; rm -rf /",
+            "grep -é KEY README.md && rm -rf /",
+            "cat -日 notes.txt && rm -rf /",
+            "grep -é KEY README.md; cat .env",
+        ] {
+            assert!(!allowed(c), "must BLOCK: {c}");
+        }
+    }
+
+    #[test]
+    fn test_w8ys_same_names_as_data_arguments_pass() {
+        for c in [
+            "fleetmail send --to X --subject s --body 'we read .env, id_rsa, server.pem and secrets.json'",
+            "echo 'head .env then tail id_rsa'",
+            "printf 'grep -r K ~/.aws/credentials\\n'",
+            "git commit -m 'rotate secrets.json and .env'",
+            "head .env.example", // example files are not protected (the older cat-env-file regex still denies `cat` of them)
+            "head ~/.ssh/id_rsa.pub",
+            "git commit -m 'note; head .env; more'",
+            "echo 'a; head .env'",
+            "grep -F '.env' README.md",
+            "grep -e '.env' README.md",
+            "jq --arg note server.pem . data.json",
+            "head <<< '.env'",
+            "grep --color=auto KEY README.md",
+            "sort -t= -k2 notes.txt",
+            "sed -i.bak 's/a/b/' notes.txt",
+            "rg -g '*.rs' KEY",
+            "jq --arg a .env . data.json",
+            "wc -l <<EOF\nsee .env and head .env\nEOF", // (the older cat-env-file regex, not this rule, still reads a cat heredoc as a read)
+            "fleetmail send --to X --body-stdin <<'EOF'\nhead .env\nread server.pem\nEOF",
+            "grep credentials README.md",
+            "cat notes.txt",
+        ] {
+            assert!(allowed(c), "must PASS: {c}");
+        }
     }
 }
