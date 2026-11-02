@@ -56,7 +56,8 @@ pub fn check_command(
     if config.bash.block_variable_commands && analysis.has_dynamic_command {
         return Decision::deny(
             "dynamic-command",
-            "Dynamic command execution detected (variable or command substitution in command position)",
+            "Dynamic command execution detected (variable or command substitution in command position). \
+             Fix: write the binary path literally (/path/bin args), or set vars inline: env VAR=x /path/bin args.",
         );
     }
 
@@ -227,7 +228,8 @@ fn check_command_fallback(
     if config.bash.block_variable_commands && shell::has_variable_execution(command) {
         return Decision::deny(
             "variable-command",
-            "Variable-based command execution is blocked for security",
+            "Variable-based command execution is blocked for security. \
+             Fix: write the binary path literally (/path/bin args), or set vars inline: env VAR=x /path/bin args.",
         );
     }
 
@@ -531,6 +533,36 @@ mod tests {
         );
         assert!(decision.is_deny());
         assert_eq!(decision.rule_id(), Some("dynamic-command"));
+    }
+
+    #[test]
+    fn test_dynamic_command_block_names_the_fix() {
+        let config = test_config();
+        let (bash_rules, exfil_rules) = compile_rules(SafetyLevel::High);
+
+        let blocked = check_command(
+            "$CMD --flag",
+            &config,
+            SafetyLevel::High,
+            &bash_rules,
+            &exfil_rules,
+        );
+        assert!(blocked.is_deny());
+        assert!(blocked.reason().contains("env VAR=x /path/bin args"));
+
+        // The fix the message names must itself pass.
+        let fixed = check_command(
+            "env VAR=x /usr/bin/true --flag",
+            &config,
+            SafetyLevel::High,
+            &bash_rules,
+            &exfil_rules,
+        );
+        assert!(
+            fixed.is_allow(),
+            "named fix was blocked: {}",
+            fixed.reason()
+        );
     }
 
     #[test]
