@@ -35,7 +35,12 @@ pub const ALL_PACKS: &[PackInfo] = &[
     },
     PackInfo {
         name: "core.git",
-        description: "Destructive git (reset --hard, force push, clean -fd)",
+        description: "Destructive git (discarded work, any force push, history rewrite, hooks off)",
+        always_on: false,
+    },
+    PackInfo {
+        name: "core.delete",
+        description: "Recursive rm outside temp dirs and build output (rm -rf src)",
         always_on: false,
     },
     PackInfo {
@@ -93,8 +98,18 @@ pub fn pack_of(id: &str) -> &'static str {
         | "sudo-bash-c" => "core.exec",
 
         // core.git
-        "git-force-main" | "git-force-main-alt" | "git-reset-hard" | "git-clean-force"
-        | "git-force-any" => "core.git",
+        "git-force-main"
+        | "git-force-main-alt"
+        | "git-reset-hard"
+        | "git-clean-force"
+        | "git-force-any"
+        | "git-discard"
+        | "git-force-push"
+        | "git-history-rewrite"
+        | "git-hooks-off" => "core.git",
+
+        // core.delete — recursive deletes outside temp dirs and build output
+        "rm-recursive" => "core.delete",
 
         // core.secrets — secret exposure in commands
         "echo-secret-env" | "printenv-all" | "env-dump" | "cat-env-file" | "cat-ssh-key" => {
@@ -172,6 +187,9 @@ mod tests {
     fn test_known_ids_mapped() {
         assert_eq!(pack_of("rm-root"), "core.filesystem");
         assert_eq!(pack_of("git-reset-hard"), "core.git");
+        assert_eq!(pack_of("git-discard"), "core.git");
+        assert_eq!(pack_of("git-hooks-off"), "core.git");
+        assert_eq!(pack_of("rm-recursive"), "core.delete");
         assert_eq!(pack_of("docker-privileged"), "containers.docker");
         assert_eq!(pack_of("drop-database"), "database");
         assert_eq!(pack_of("env-file"), "secrets.files");

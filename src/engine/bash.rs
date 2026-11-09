@@ -9,6 +9,7 @@ use crate::output::Decision;
 use crate::parser::ast;
 use crate::parser::{shell, wrapper};
 use crate::rules::dangerous;
+use crate::rules::destructive;
 use crate::rules::exfiltration;
 use crate::rules::packs;
 use crate::rules::secret_read;
@@ -23,6 +24,27 @@ fn secret_read_decision(text: &str, config: &Config) -> Option<Decision> {
         return None;
     }
     secret_read::command_reason(text).map(|reason| Decision::deny("secret-read", reason))
+}
+
+/// Destructive git and recursive deletes (token-based, see `rules::destructive`). High level and
+/// up; a rule whose pack is disabled is skipped so a later one in the command still counts.
+/// `whole` holds the full command's variables when `text` is one command cut out of it.
+fn destructive_decision(
+    text: &str,
+    whole: Option<&destructive::Vars>,
+    config: &Config,
+    level: SafetyLevel,
+) -> Option<Decision> {
+    if !level.includes(SafetyLevel::High) {
+        return None;
+    }
+    let disabled = &config.packs.disabled;
+    let enabled = |id: &str| !packs::is_disabled(packs::pack_of(id), disabled);
+    let hit = match whole {
+        Some(vars) => destructive::command_reason_in(text, vars, &enabled),
+        None => destructive::command_reason(text, &enabled),
+    };
+    hit.map(|hit| Decision::deny(hit.id, hit.reason))
 }
 
 /// Check a bash command for security issues using AST-based analysis
@@ -88,6 +110,7 @@ pub fn check_command(
     }
 
     // 6. Check each normalized command against dangerous patterns
+    let vars = destructive::Vars::of(command);
     for cmd in &analysis.commands {
         // Use normalized command name for matching
         let _normalized_name = &cmd.name;
@@ -125,6 +148,10 @@ pub fn check_command(
             &config.packs.disabled,
             raw_select,
         ) {
+            return decision;
+        }
+
+        if let Some(decision) = destructive_decision(check_str, Some(&vars), config, safety_level) {
             return decision;
         }
 
@@ -175,6 +202,11 @@ pub fn check_command(
     // 6b. Secret-path readers on the whole command: the splitter in secret_read is
     // quote-aware and heredoc-aware, unlike split_compound_command below.
     if let Some(decision) = secret_read_decision(command, config) {
+        return decision;
+    }
+
+    // 6c. Destructive git and recursive deletes on the whole command, with the same splitter.
+    if let Some(decision) = destructive_decision(command, None, config, safety_level) {
         return decision;
     }
 
@@ -291,6 +323,10 @@ fn check_command_fallback(
         {
             return decision;
         }
+    }
+
+    if let Some(decision) = destructive_decision(command, None, config, safety_level) {
+        return decision;
     }
 
     Decision::allow("passed all checks (fallback)")

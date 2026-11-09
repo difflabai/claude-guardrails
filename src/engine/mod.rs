@@ -7,6 +7,9 @@ pub mod common;
 pub mod file;
 pub mod selfprotect;
 
+#[cfg(test)]
+mod destructive_tests;
+
 use crate::allowonce::AllowOnceStore;
 use crate::config::{Config, SafetyLevel};
 use crate::input::{HookInput, ToolInput};

