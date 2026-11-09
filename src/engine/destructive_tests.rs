@@ -11,13 +11,27 @@ fn decide(command: &str) -> Decision {
     SecurityEngine::new(Config::default()).check_bash(command)
 }
 
+/// The decision's kind as a fixed word. Failure messages print only this and the test's
+/// own literals, never the decision's fields: CodeQL `rust/cleartext-logging` treats any
+/// value from `secret_read_decision` as sensitive (alerts 10-12 on PR #9).
+fn kind(d: &Decision) -> &'static str {
+    match d {
+        Decision::Allow { .. } => "allow",
+        Decision::Deny { .. } => "deny",
+        Decision::Warn { .. } => "warn",
+    }
+}
+
 fn assert_blocked(cases: &[&str], rule: &str) {
     for c in cases {
-        match decide(c) {
-            Decision::Deny { rule_id, .. } => {
-                assert_eq!(rule_id, rule, "{c}: denied by {rule_id}, expected {rule}")
-            }
-            other => panic!("{c}: expected deny by {rule}, got {other:?}"),
+        let d = decide(c);
+        match &d {
+            Decision::Deny { rule_id, .. } => assert!(
+                rule_id == rule,
+                "{c}: denied by another rule, expected {rule}; \
+                 `claude-guardrails explain` names it"
+            ),
+            _ => panic!("{c}: expected deny by {rule}, got {}", kind(&d)),
         }
     }
 }
@@ -25,7 +39,7 @@ fn assert_blocked(cases: &[&str], rule: &str) {
 fn assert_passes(cases: &[&str]) {
     for c in cases {
         let d = decide(c);
-        assert!(d.is_allow(), "{c}: expected allow, got {d:?}");
+        assert!(d.is_allow(), "{c}: expected allow, got {}", kind(&d));
     }
 }
 
