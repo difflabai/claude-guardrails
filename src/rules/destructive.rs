@@ -134,8 +134,8 @@ const MAX_DEPTH: u8 = 3;
 /// the top level, not after `&&` or `||`, not in a pipeline, a background job, a subshell, a
 /// `{ }` group, an `if`/`case`/loop body, or a heredoc a child shell runs. Anywhere else, and
 /// wherever the name is handed to a command (`for S`, `read S`, `unset S`, `local S=…`), the
-/// variable becomes unknown for the rest of the command, and a target written through it is
-/// not judged safe.
+/// variable becomes unknown until a sure assignment sets it again, and a target written
+/// through it is never judged safe, not even as `$TMPDIR/…`.
 #[derive(Default)]
 struct Ctx<'a> {
     vars: HashMap<String, String>,
@@ -165,25 +165,30 @@ impl Vars {
 }
 
 impl Ctx<'_> {
+    /// True when `name` was assigned where its value cannot be known, and no sure assignment
+    /// in this command has set it since.
     fn is_unknown(&self, name: &str) -> bool {
-        self.unknown.contains(name) || self.base.is_some_and(|b| b.unknown.contains(name))
+        !self.vars.contains_key(name)
+            && (self.unknown.contains(name) || self.base.is_some_and(|b| b.unknown.contains(name)))
     }
 
     fn get(&self, name: &str) -> Option<&String> {
+        if let Some(value) = self.vars.get(name) {
+            return Some(value);
+        }
         if self.is_unknown(name) {
             return None;
         }
-        self.vars
-            .get(name)
-            .or_else(|| self.base.and_then(|b| b.vars.get(name)))
+        self.base.and_then(|b| b.vars.get(name))
     }
 
     /// Record `NAME=value`. When `sure` is false the assignment may not reach this shell, so
-    /// the name becomes unknown, and stays unknown for the rest of the command.
+    /// the name becomes unknown until a sure assignment sets it again.
     fn set(&mut self, assignment: &str, sure: bool) {
         if let Some((name, value)) = assignment.split_once('=') {
-            if sure && !self.is_unknown(name) {
+            if sure {
                 let value = self.expand(value);
+                self.unknown.remove(name);
                 self.vars.insert(name.to_string(), value);
             } else {
                 self.forget(name);
@@ -199,7 +204,10 @@ impl Ctx<'_> {
     /// True when the git directory or worktree that variable `name` names (if any) is under a
     /// temp root.
     fn tree_is_temp(&self, name: &str) -> bool {
-        !self.is_unknown(name) && self.get(name).is_none_or(|v| is_temp_path(v))
+        match self.get(name) {
+            Some(v) => is_temp_path(v),
+            None => !self.is_unknown(name),
+        }
     }
 
     /// Replace `$NAME` and `${NAME}` with known values; leave anything else as written.
@@ -221,9 +229,23 @@ impl Ctx<'_> {
                     (&after[..end], end)
                 }
             };
+            // `${TMPDIR%/}` is TMPDIR with an operator: judge it by the name.
+            let ident = name
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .map_or(name, |end| &name[..end]);
             match self.get(name) {
                 Some(value) if is_assignment(&format!("{name}=")) => {
                     out.push_str(value);
+                    rest = &after[used..];
+                }
+                // Assigned in this command, but its value here cannot be known (an unknown
+                // assignment, or `${NAME%…}` of a known one): never a temp path, so the
+                // literal `$TMPDIR/` exemption cannot apply to it.
+                _ if used > 0
+                    && is_assignment(&format!("{ident}="))
+                    && (self.is_unknown(ident) || self.get(ident).is_some()) =>
+                {
+                    out.push_str(UNKNOWN_VALUE);
                     rest = &after[used..];
                 }
                 _ => {
@@ -383,6 +405,27 @@ fn names_hooks_path(s: &str) -> bool {
     s.to_ascii_lowercase().contains("core.hookspath")
 }
 
+/// Commands that set the shell variables named in their arguments (`printf -v` is handled on
+/// its own; `export` is handled as an assignment).
+const SETS_NAMES: &[&str] = &[
+    "for",
+    "select",
+    "read",
+    "unset",
+    "local",
+    "declare",
+    "typeset",
+    "readonly",
+    "let",
+    "getopts",
+    "mapfile",
+    "readarray",
+];
+
+/// What `$NAME` expands to when NAME was assigned where its value cannot be known: an
+/// absolute path that is under no temp root and names nothing real.
+const UNKNOWN_VALUE: &str = "/\u{0}unknown-variable";
+
 /// Keywords that can come before a command's program name.
 const KEYWORDS: &[&str] = &[
     "if", "then", "elif", "else", "while", "until", "do", "!", "time",
@@ -485,10 +528,24 @@ fn segment_reason(
             .for_each(|a| ctx.set(a, sure));
         return None;
     }
-    // A name handed to a command may be set by it (`for S in`, `read S`, `unset S`,
-    // `local S=…`, `printf -v S`): its value is unknown from here on.
-    for a in args {
-        let name = a.split_once('=').map_or(a.as_str(), |(n, _)| n);
+    // A command that sets the variables it is handed (`for S in`, `read S`, `unset S`,
+    // `local S=…`, `printf -v S`): their values are unknown from here on. Any other command's
+    // arguments (`echo S`) leave variables alone.
+    let handed: Vec<&str> = if SETS_NAMES.contains(&prog) {
+        args.iter().map(String::as_str).collect()
+    } else if prog == "printf" {
+        args.iter()
+            .enumerate()
+            .filter_map(|(k, a)| match a.as_str() {
+                "-v" => args.get(k + 1).map(String::as_str),
+                _ => a.strip_prefix("-v").filter(|n| !n.is_empty()),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    for a in handed {
+        let name = a.split_once('=').map_or(a, |(n, _)| n);
         if is_assignment(&format!("{name}=")) {
             ctx.forget(name);
         }

@@ -396,6 +396,7 @@ fn blocks_assignments_that_may_not_reach_the_parent_shell() {
             "S=/tmp/s; for S in /Users/me; do rm -rf $S/project; done",
             "S=/tmp/s; read S; rm -rf $S/project",
             "S=/tmp/s; unset S; rm -rf $S/project",
+            "S=/tmp/s; printf -v S %s /Users/me; rm -rf $S/project",
             "(true; echo \")\"; S=/tmp/s; true); rm -rf $S/project",
             "(case x in a) true;; esac; S=/tmp/s; true); rm -rf $S/project",
         ],
@@ -410,7 +411,27 @@ fn passes_assignments_that_always_run() {
         "S=/tmp/s || exit 1; rm -rf $S/x",
         "true; S=/tmp/s; rm -rf $S/x",
         "ls & S=/tmp/s; rm -rf $S/x",
+        // A plain argument that looks like a name does not change the variable.
+        "S=/tmp/s; echo S; rm -rf \"$S/x\"",
+        // A sure reassignment after a maybe-assignment makes the value known again.
+        "false && S=/Users/me; S=/tmp/s; rm -rf $S/x",
     ]);
+}
+
+#[test]
+fn blocks_tmpdir_that_was_assigned_or_made_unknown() {
+    // The literal `$TMPDIR/` exemption holds only for a TMPDIR the command never assigned.
+    assert_blocked(
+        &[
+            "TMPDIR=/Users/me; echo TMPDIR; rm -rf \"$TMPDIR/project\"",
+            "TMPDIR=/Users/me; rm -rf \"$TMPDIR/project\"",
+            "false && TMPDIR=/tmp/x; rm -rf \"$TMPDIR/project\"",
+            "read TMPDIR; rm -rf \"$TMPDIR/project\"",
+            "(TMPDIR=/Users/me; true); rm -rf $TMPDIR/node_modules",
+            "TMPDIR=/Users/me; rm -rf \"${TMPDIR%/}/project\"",
+        ],
+        "rm-recursive",
+    );
 }
 
 #[test]
