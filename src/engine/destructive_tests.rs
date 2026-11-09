@@ -6,6 +6,7 @@
 use super::SecurityEngine;
 use crate::config::Config;
 use crate::output::Decision;
+use crate::rules::destructive;
 
 fn decide(command: &str) -> Decision {
     SecurityEngine::new(Config::default()).check_bash(command)
@@ -22,8 +23,16 @@ fn kind(d: &Decision) -> &'static str {
     }
 }
 
+/// Deny by `rule` through the engine, and by the token rule on its own: the old regex rules
+/// share the ids `git-reset-hard` and `git-clean-force`, so an engine deny alone does not prove
+/// the token rule ran.
 fn assert_blocked(cases: &[&str], rule: &str) {
     for c in cases {
+        let direct = destructive::command_reason(c, &|_| true).map(|h| h.id);
+        assert!(
+            direct == Some(rule),
+            "{c}: the token rule alone does not deny it by {rule}"
+        );
         let d = decide(c);
         match &d {
             Decision::Deny { rule_id, .. } => assert!(
@@ -196,6 +205,18 @@ fn blocks_destructive_commands_inside_wrappers_and_shells() {
     assert_blocked(&["timeout 5 git restore ."], "git-discard");
     assert_blocked(&["command rm -rf src", "\\rm -rf src"], "rm-recursive");
     assert_blocked(&["git status\ngit stash clear"], "git-discard");
+    // A keyword before the program name: the program is the next word.
+    assert_blocked(
+        &[
+            "if true; then rm -rf src; fi",
+            "while true; do rm -rf src; done",
+        ],
+        "rm-recursive",
+    );
+    assert_blocked(
+        &["! git stash clear", "if git stash clear; then :; fi"],
+        "git-discard",
+    );
 }
 
 #[test]
@@ -325,6 +346,89 @@ fn blocks_what_variables_and_temp_clones_do_not_excuse() {
         ],
         "git-discard",
     );
+}
+
+#[test]
+fn blocks_force_refspec_after_dashdash() {
+    assert_blocked(
+        &["git push -- origin +main", "git push origin -- +HEAD:main"],
+        "git-force-push",
+    );
+}
+
+#[test]
+fn hooks_off_does_not_mask_a_destructive_subcommand() {
+    // Hooks off is excused in a scratch clone; the destructive action next to it is not.
+    assert_blocked(
+        &["git -C /tmp/clone -c core.hooksPath=/dev/null reset --hard"],
+        "git-reset-hard",
+    );
+    assert_blocked(
+        &["git -C /tmp/clone rebase -i --no-verify HEAD~3"],
+        "git-history-rewrite",
+    );
+    assert_blocked(
+        &["git -C /tmp/clone -c core.hooksPath=/dev/null push --force origin x"],
+        "git-force-push",
+    );
+}
+
+#[test]
+fn blocks_assignments_that_may_not_reach_the_parent_shell() {
+    // A subshell, a pipeline, a background job, a child shell's heredoc, or a branch that may
+    // not run: the variable's value after it is unknown, so the target cannot be judged.
+    assert_blocked(
+        &[
+            "S=/Users/me; (S=/tmp/s); rm -rf \"$S/project\"",
+            "(S=/tmp/s); rm -rf $S/project",
+            "(S=/tmp/s; true); rm -rf $S/project",
+            "x=$(true; S=/tmp/s); rm -rf $S/project",
+            "false && S=/tmp/s; rm -rf $S/project",
+            "test -d x || S=/tmp/s; rm -rf $S/project",
+            "false && { true; S=/tmp/s; }; rm -rf $S/project",
+            "S=/tmp/s | true; rm -rf $S/project",
+            "S=/tmp/s & rm -rf $S/project",
+            "bash <<EOF\nS=/tmp/s\nEOF\nrm -rf $S/project",
+            "if false; then S=/tmp/s; fi; rm -rf $S/project",
+            "false && eval S=/tmp/s; rm -rf $S/project",
+            "S=/tmp/s; if true; then S=/Users/me; fi; rm -rf $S/project",
+            "S=/Users/me; if false; then echo done; S=/tmp/s; fi; rm -rf $S/project",
+            "S=/tmp/s; for S in /Users/me; do rm -rf $S/project; done",
+            "S=/tmp/s; read S; rm -rf $S/project",
+            "S=/tmp/s; unset S; rm -rf $S/project",
+            "(true; echo \")\"; S=/tmp/s; true); rm -rf $S/project",
+            "(case x in a) true;; esac; S=/tmp/s; true); rm -rf $S/project",
+        ],
+        "rm-recursive",
+    );
+}
+
+#[test]
+fn passes_assignments_that_always_run() {
+    assert_passes(&[
+        "S=/tmp/s && rm -rf $S/x",
+        "S=/tmp/s || exit 1; rm -rf $S/x",
+        "true; S=/tmp/s; rm -rf $S/x",
+        "ls & S=/tmp/s; rm -rf $S/x",
+    ]);
+}
+
+#[test]
+fn temp_dash_c_does_not_excuse_another_git_dir() {
+    assert_blocked(
+        &[
+            "git -C /tmp/s --git-dir=/Users/me/repo/.git --work-tree=/Users/me/repo checkout -- .",
+            "git -C /tmp/s --work-tree /Users/me/repo checkout -- .",
+            "git --git-dir /Users/me/repo/.git -C /tmp/s restore .",
+            "GIT_WORK_TREE=/Users/me/repo git -C /tmp/s checkout -- .",
+            "env GIT_DIR=/Users/me/repo/.git git -C /tmp/s checkout -- .",
+            "export GIT_DIR=/Users/me/repo/.git; git -C /tmp/s restore .",
+            "export GIT_WORK_TREE=/Users/me/repo; git -C /tmp/s restore .",
+            "git -C /tmp/s -c core.worktree=/Users/me/repo checkout -- .",
+        ],
+        "git-discard",
+    );
+    assert_passes(&["git -C /tmp/s --git-dir=/tmp/s/.git checkout -- ."]);
 }
 
 #[test]

@@ -13,12 +13,14 @@
 //!
 //! Limits (not covered): git aliases, `git checkout <path>` without `--` (a path and a branch
 //! name look the same as tokens), commands inside a script file or a substitution the AST does
-//! not hand over, `ssh host <command>`, and shells nested deeper than 3.
+//! not hand over, `ssh host <command>`, shells nested deeper than 3, and variables set where
+//! the text does not show it (a sourced file, a function defined earlier, `eval "$x"`, the
+//! environment the command starts with).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::rules::secret_read::{
-    basename, is_duration, split_unquoted, wrapper_valued_options, SEPARATORS, SHELLS,
+    basename, is_duration, split_unquoted_ends, wrapper_valued_options, PartEnd, SEPARATORS, SHELLS,
 };
 
 /// A matched rule: its id (for packs, audit and allow-once) and the reason shown to the model.
@@ -127,38 +129,77 @@ const MAX_DEPTH: u8 = 3;
 /// Shell variables set earlier in the same command (`S=/tmp/x; rm -rf $S/y`), so a target
 /// written through a variable can be judged. Only plain `NAME=value` statements and
 /// `export NAME=value` count; `NAME=value cmd` sets the variable for `cmd` alone.
+///
+/// An assignment counts only where it surely runs in this shell: a statement of its own, at
+/// the top level, not after `&&` or `||`, not in a pipeline, a background job, a subshell, a
+/// `{ }` group, an `if`/`case`/loop body, or a heredoc a child shell runs. Anywhere else, and
+/// wherever the name is handed to a command (`for S`, `read S`, `unset S`, `local S=…`), the
+/// variable becomes unknown for the rest of the command, and a target written through it is
+/// not judged safe.
 #[derive(Default)]
 struct Ctx<'a> {
     vars: HashMap<String, String>,
+    unknown: HashSet<String>,
     /// Variables of the whole command, when this one was cut out of it.
-    base: Option<&'a HashMap<String, String>>,
+    base: Option<&'a Vars>,
 }
 
-/// The variables a whole command sets (last value wins). Build it once per command check and
-/// pass it to [`command_reason_in`] for each command the AST cuts out of it.
+/// The variables a whole command sets (last value wins), and the ones it may set to a value
+/// it cannot know. Build it once per command check and pass it to [`command_reason_in`] for
+/// each command the AST cuts out of it.
 #[derive(Default)]
-pub struct Vars(HashMap<String, String>);
+pub struct Vars {
+    vars: HashMap<String, String>,
+    unknown: HashSet<String>,
+}
 
 impl Vars {
     pub fn of(command: &str) -> Vars {
         let mut ctx = Ctx::default();
-        let _ = command_reason_depth(command, 0, &|_| false, &mut ctx);
-        Vars(ctx.vars)
+        let _ = command_reason_depth(command, 0, &|_| false, &mut ctx, true);
+        Vars {
+            vars: ctx.vars,
+            unknown: ctx.unknown,
+        }
     }
 }
 
 impl Ctx<'_> {
-    fn get(&self, name: &str) -> Option<&String> {
-        self.vars
-            .get(name)
-            .or_else(|| self.base.and_then(|b| b.get(name)))
+    fn is_unknown(&self, name: &str) -> bool {
+        self.unknown.contains(name) || self.base.is_some_and(|b| b.unknown.contains(name))
     }
 
-    fn set(&mut self, assignment: &str) {
-        if let Some((name, value)) = assignment.split_once('=') {
-            let value = self.expand(value);
-            self.vars.insert(name.to_string(), value);
+    fn get(&self, name: &str) -> Option<&String> {
+        if self.is_unknown(name) {
+            return None;
         }
+        self.vars
+            .get(name)
+            .or_else(|| self.base.and_then(|b| b.vars.get(name)))
+    }
+
+    /// Record `NAME=value`. When `sure` is false the assignment may not reach this shell, so
+    /// the name becomes unknown, and stays unknown for the rest of the command.
+    fn set(&mut self, assignment: &str, sure: bool) {
+        if let Some((name, value)) = assignment.split_once('=') {
+            if sure && !self.is_unknown(name) {
+                let value = self.expand(value);
+                self.vars.insert(name.to_string(), value);
+            } else {
+                self.forget(name);
+            }
+        }
+    }
+
+    fn forget(&mut self, name: &str) {
+        self.vars.remove(name);
+        self.unknown.insert(name.to_string());
+    }
+
+    /// True when the git directory or worktree that variable `name` names (if any) is under a
+    /// temp root.
+    fn tree_is_temp(&self, name: &str) -> bool {
+        !self.is_unknown(name) && self.get(name).is_none_or(|v| is_temp_path(v))
     }
 
     /// Replace `$NAME` and `${NAME}` with known values; leave anything else as written.
@@ -198,7 +239,7 @@ impl Ctx<'_> {
 
 /// The first destructive action in `command` whose rule `enabled` accepts.
 pub fn command_reason(command: &str, enabled: &dyn Fn(&str) -> bool) -> Option<Hit> {
-    command_reason_depth(command, 0, enabled, &mut Ctx::default())
+    command_reason_depth(command, 0, enabled, &mut Ctx::default(), true)
 }
 
 /// Like [`command_reason`] for one command cut out of a whole command (the AST hands commands
@@ -211,32 +252,119 @@ pub fn command_reason_in(
     enabled: &dyn Fn(&str) -> bool,
 ) -> Option<Hit> {
     let mut ctx = Ctx {
-        vars: HashMap::new(),
-        base: Some(&whole.0),
+        base: Some(whole),
+        ..Ctx::default()
     };
-    command_reason_depth(command, 0, enabled, &mut ctx)
+    command_reason_depth(command, 0, enabled, &mut ctx, true)
 }
 
+/// `sure` is false when `command` itself may not run in this shell (an `eval` after `&&`):
+/// then no assignment in it counts.
 fn command_reason_depth(
     command: &str,
     depth: u8,
     enabled: &dyn Fn(&str) -> bool,
     ctx: &mut Ctx<'_>,
+    sure: bool,
 ) -> Option<Hit> {
-    for part in split_unquoted(command) {
+    let parts = split_unquoted_ends(command);
+    let sure = sure && !has_case(&parts);
+    // Open subshells, `{ }` groups and if/case/loop bodies before the current part.
+    let mut nest: i64 = 0;
+    for (k, (part, end)) in parts.iter().enumerate() {
         // An unbalanced quote makes shlex give up; check the bare words instead of nothing.
-        let tokens = shlex::split(&part).unwrap_or_else(|| {
+        let tokens = shlex::split(part).unwrap_or_else(|| {
             part.split_whitespace()
                 .map(|t| t.trim_matches(['\'', '"']).to_string())
                 .collect()
         });
+        let (opens, closes) = nesting(part, &tokens);
+        let part_sure = sure
+            && nest == 0
+            && opens == 0
+            && closes == 0
+            && starts_a_statement(&parts, k)
+            && ends_a_statement(&parts, k, *end);
         for seg in tokens.split(|t| SEPARATORS.contains(&t.as_str())) {
-            if let Some(hit) = segment_reason(seg, depth, enabled, ctx) {
+            if let Some(hit) = segment_reason(seg, depth, enabled, ctx, part_sure) {
                 return Some(hit);
             }
         }
+        nest = (nest + opens - closes).max(0);
     }
     None
+}
+
+/// True when part `k` runs whatever the part before it did: it opens the text, or follows
+/// `;`, a newline, a background `&`, or a heredoc body. Not after `&&`, `||` or a pipe.
+fn starts_a_statement(parts: &[(String, PartEnd)], k: usize) -> bool {
+    let Some(prev) = k.checked_sub(1).map(|p| &parts[p]) else {
+        return true;
+    };
+    match prev.1 {
+        PartEnd::Op(';' | '\n') | PartEnd::ShellHeredoc | PartEnd::End => true,
+        // `a & b`: `a` runs in the background, `b` runs anyway. In `a && b` the part
+        // between the two `&` is empty.
+        PartEnd::Op('&') => !prev.0.trim().is_empty(),
+        PartEnd::Op(_) => false,
+    }
+}
+
+/// True when part `k` (ended by `end`) runs in this shell: it is followed by `;`, a newline,
+/// `&&`, `||`, or the end. Not before a pipe or a background `&`, and not a heredoc body that
+/// a child shell runs.
+fn ends_a_statement(parts: &[(String, PartEnd)], k: usize, end: PartEnd) -> bool {
+    match end {
+        PartEnd::Op(';' | '\n') | PartEnd::End => true,
+        PartEnd::Op(c @ ('&' | '|')) => parts
+            .get(k + 1)
+            .is_some_and(|(p, e)| p.is_empty() && *e == PartEnd::Op(c)),
+        PartEnd::Op(_) | PartEnd::ShellHeredoc => false,
+    }
+}
+
+const OPENERS: &[&str] = &["if", "case", "while", "until", "for", "select"];
+const CLOSERS: &[&str] = &["fi", "esac", "done"];
+
+/// How many subshells, groups and compound commands `part` opens and closes. Opens are
+/// counted generously (every `(` outside single quotes, quoted or not) and closes strictly
+/// (a `)` outside all quotes), so a miscount only makes later assignments count less.
+fn nesting(part: &str, tokens: &[String]) -> (i64, i64) {
+    let (mut opens, mut closes) = (0i64, 0i64);
+    let (mut single, mut double, mut escaped) = (false, false, false);
+    for c in part.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if !single => escaped = true,
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
+            '(' | '`' if !single => opens += 1,
+            ')' if !single && !double => closes += 1,
+            _ => {}
+        }
+    }
+    for (i, t) in tokens.iter().enumerate() {
+        // A closing word counts only where a command starts; an opening one counts anywhere.
+        let at_start = i == 0 || SEPARATORS.contains(&tokens[i - 1].as_str());
+        if t == "{" || OPENERS.contains(&t.trim_start_matches(['(', '{'])) {
+            opens += 1;
+        } else if at_start && (t == "}" || CLOSERS.contains(&t.trim_end_matches([')', '}']))) {
+            closes += 1;
+        }
+    }
+    (opens, closes)
+}
+
+/// `case` patterns end in a bare `)` that closes nothing, so with a `case` anywhere the
+/// nesting count cannot be trusted.
+fn has_case(parts: &[(String, PartEnd)]) -> bool {
+    parts.iter().any(|(p, _)| {
+        p.split_whitespace()
+            .any(|w| w.trim_start_matches(['(', '{']) == "case")
+    })
 }
 
 /// `NAME=value` with a shell variable name.
@@ -255,11 +383,18 @@ fn names_hooks_path(s: &str) -> bool {
     s.to_ascii_lowercase().contains("core.hookspath")
 }
 
+/// Keywords that can come before a command's program name.
+const KEYWORDS: &[&str] = &[
+    "if", "then", "elif", "else", "while", "until", "do", "!", "time",
+];
+
+/// `sure` is false when this segment may not run in this shell; see [`Ctx`].
 fn segment_reason(
     raw: &[String],
     depth: u8,
     enabled: &dyn Fn(&str) -> bool,
     ctx: &mut Ctx<'_>,
+    sure: bool,
 ) -> Option<Hit> {
     // A subshell's parentheses stay glued to the words beside them: `(cd x`, `--hard)`.
     let mut seg: Vec<String> = raw.to_vec();
@@ -273,15 +408,34 @@ fn segment_reason(
     }
     seg.retain(|t| !t.is_empty());
 
-    // Skip leading VAR=val assignments and wrapper programs (with their options).
+    // Skip leading keywords (`if git reset --hard; then`), VAR=val assignments and wrapper
+    // programs (with their options). An assignment after a keyword is inside a compound
+    // command, which the nesting count already marks as not sure.
+    let mut i = 0;
+    while i < seg.len() && KEYWORDS.contains(&seg[i].as_str()) {
+        i += 1;
+    }
+    let seg = seg.split_off(i);
     let mut i = 0;
     let mut via_xargs = false;
+    // GIT_DIR / GIT_WORK_TREE / core.worktree given on this command line: the git dir or
+    // worktree they name, as written.
+    let mut trees: Vec<String> = Vec::new();
     while i < seg.len() {
         let t = seg[i].trim_start_matches('\\');
         if is_assignment(t) {
             // GIT_CONFIG_KEY_0=core.hooksPath, GIT_CONFIG_PARAMETERS='core.hooksPath=…'
             if t.starts_with("GIT_CONFIG") && names_hooks_path(t) && enabled(HOOKS_OFF.id) {
                 return Some(HOOKS_OFF);
+            }
+            if let Some(v) = t
+                .strip_prefix("GIT_DIR=")
+                .or_else(|| t.strip_prefix("GIT_WORK_TREE="))
+            {
+                trees.push(ctx.expand(v));
+            }
+            if t.starts_with("GIT_CONFIG") && names_worktree(t) {
+                trees.push(String::new());
             }
             i += 1;
             continue;
@@ -319,7 +473,7 @@ fn segment_reason(
         break;
     }
     if i == seg.len() && seg.iter().all(|t| is_assignment(t)) {
-        seg.iter().for_each(|t| ctx.set(t));
+        seg.iter().for_each(|t| ctx.set(t, sure));
         return None;
     }
     let prog_tok = seg.get(i)?.trim_start_matches('\\');
@@ -328,8 +482,16 @@ fn segment_reason(
     if prog == "export" {
         args.iter()
             .filter(|a| is_assignment(a))
-            .for_each(|a| ctx.set(a));
+            .for_each(|a| ctx.set(a, sure));
         return None;
+    }
+    // A name handed to a command may be set by it (`for S in`, `read S`, `unset S`,
+    // `local S=…`, `printf -v S`): its value is unknown from here on.
+    for a in args {
+        let name = a.split_once('=').map_or(a.as_str(), |(n, _)| n);
+        if is_assignment(&format!("{name}=")) {
+            ctx.forget(name);
+        }
     }
 
     if depth < MAX_DEPTH {
@@ -344,10 +506,11 @@ fn segment_reason(
                 depth + 1,
                 enabled,
                 &mut Ctx::default(),
+                true,
             );
         }
         if prog == "eval" {
-            return command_reason_depth(&args.join(" "), depth + 1, enabled, ctx);
+            return command_reason_depth(&args.join(" "), depth + 1, enabled, ctx, sure);
         }
         // find … -exec rm -rf {} +
         if prog == "find" {
@@ -358,7 +521,8 @@ fn segment_reason(
                         .iter()
                         .position(|a| a == ";" || a == "+")
                         .map_or(args.len(), |p| k + 1 + p);
-                    if let Some(hit) = segment_reason(&args[k + 1..end], depth + 1, enabled, ctx) {
+                    let exec = &args[k + 1..end];
+                    if let Some(hit) = segment_reason(exec, depth + 1, enabled, ctx, false) {
                         return Some(hit);
                     }
                     k = end;
@@ -370,7 +534,7 @@ fn segment_reason(
     }
 
     let hit = match prog {
-        "git" => git_reason(args, ctx),
+        "git" => git_reason(args, ctx, &trees),
         "rm" => rm_reason(args, via_xargs, ctx),
         _ => None,
     }?;
@@ -458,11 +622,18 @@ const COMMIT_LONG: &[&str] = &[
     "--pathspec-from-file",
 ];
 
-fn git_reason(args: &[String], ctx: &Ctx<'_>) -> Option<Hit> {
+fn names_worktree(s: &str) -> bool {
+    s.to_ascii_lowercase().contains("core.worktree")
+}
+
+/// `trees`: the git dirs and worktrees that `GIT_DIR`, `GIT_WORK_TREE` or a `core.worktree`
+/// config name on this command line (empty when the value is not known).
+fn git_reason(args: &[String], ctx: &Ctx<'_>, trees: &[String]) -> Option<Hit> {
     // Global options before the subcommand: -C <dir>, -c <key=value>, --git-dir <dir>, …
     let mut i = 0;
     let mut dir: Option<String> = None;
     let mut hooks_off = false;
+    let mut trees: Vec<String> = trees.to_vec();
     while i < args.len() && args[i].starts_with('-') {
         let a = args[i].as_str();
         i += 1;
@@ -473,8 +644,22 @@ fn git_reason(args: &[String], ctx: &Ctx<'_>) -> Option<Hit> {
                 .or_else(|| a.strip_prefix("-c").filter(|v| !v.is_empty())),
         };
         hooks_off |= value.is_some_and(names_hooks_path);
-        if a == "-C" {
-            dir = args.get(i).map(|d| ctx.expand(d));
+        if value.is_some_and(names_worktree) {
+            trees.push(String::new());
+        }
+        match a {
+            "-C" => dir = args.get(i).map(|d| ctx.expand(d)),
+            "--git-dir" | "--work-tree" => {
+                trees.push(args.get(i).map_or(String::new(), |t| ctx.expand(t)))
+            }
+            _ => {
+                if let Some(t) = a
+                    .strip_prefix("--git-dir=")
+                    .or_else(|| a.strip_prefix("--work-tree="))
+                {
+                    trees.push(ctx.expand(t));
+                }
+            }
         }
         if matches!(
             a,
@@ -485,21 +670,27 @@ fn git_reason(args: &[String], ctx: &Ctx<'_>) -> Option<Hit> {
     }
     let sub = args.get(i)?.as_str();
     let rest = &args[i + 1..];
-    let hit = git_subcommand_reason(sub, rest, hooks_off)?;
+    let (hit, sub_hooks_off) = git_subcommand_reason(sub, rest);
+    let hooks_off = hooks_off || sub_hooks_off;
     // Work in a scratch clone under a temp dir is disposable: discarding it, or running it with
-    // hooks off, is allowed when the clone is named with -C. Anything that reaches a remote is not.
-    let scratch = dir.as_deref().is_some_and(is_temp_path);
-    if scratch && (hit.id == "git-discard" || (hit.id == HOOKS_OFF.id && sub != "push")) {
-        return None;
+    // hooks off, is allowed when the clone is named with -C and no git dir or worktree outside
+    // a temp dir is named another way. Anything that reaches a remote is not.
+    let scratch = dir.as_deref().is_some_and(is_temp_path)
+        && trees.iter().all(|t| is_temp_path(t))
+        && ctx.tree_is_temp("GIT_DIR")
+        && ctx.tree_is_temp("GIT_WORK_TREE");
+    // Judge the destructive action first: hooks off is excused in a scratch clone, and must
+    // not hide a `reset --hard` or `rebase -i` next to it.
+    if let Some(hit) = hit {
+        if !(scratch && hit.id == "git-discard") {
+            return Some(hit);
+        }
     }
-    Some(hit)
+    (hooks_off && !(scratch && sub != "push")).then_some(HOOKS_OFF)
 }
 
-fn git_subcommand_reason(sub: &str, rest: &[String], hooks_off: bool) -> Option<Hit> {
-    if hooks_off {
-        return Some(HOOKS_OFF);
-    }
-
+/// The destructive action of `git <sub> <rest>`, if any, and whether it turns hooks off.
+fn git_subcommand_reason(sub: &str, rest: &[String]) -> (Option<Hit>, bool) {
     let p = match sub {
         "commit" => parse(rest, "mFCct", "Su", COMMIT_LONG),
         "push" => parse(
@@ -534,15 +725,16 @@ fn git_subcommand_reason(sub: &str, rest: &[String], hooks_off: bool) -> Option<
         ),
         _ => parse(rest, "", "", &[]),
     };
-    if p.long("--no-verify") {
-        return Some(HOOKS_OFF);
-    }
+    let no_verify = p.long("--no-verify");
     let force = p.short('f') || p.long("--force");
     let first = p.operands.first().copied();
     let hit = match sub {
         "reset" if p.long("--hard") => RESET_HARD,
         "clean" if force && !(p.short('n') || p.long("--dry-run")) => CLEAN_FORCE,
-        "checkout" if p.long("--ours") || p.long("--theirs") => return None,
+        "checkout" if p.long("--ours") || p.long("--theirs") => return (None, no_verify),
+        // `git checkout <path>` without `--` is not denied: as tokens a path and a branch name
+        // look the same, and denying every `git checkout <name>` would block switching
+        // branches. A known gap, listed under Limits at the top of this file.
         "checkout"
             if force
                 || (p.dashdash && !p.after_dashdash.is_empty())
@@ -551,7 +743,7 @@ fn git_subcommand_reason(sub: &str, rest: &[String], hooks_off: bool) -> Option<
         {
             CHECKOUT_PATHS
         }
-        "restore" if p.long("--ours") || p.long("--theirs") => return None,
+        "restore" if p.long("--ours") || p.long("--theirs") => return (None, no_verify),
         "restore"
             if p.short('W') || p.long("--worktree") || !(p.short('S') || p.long("--staged")) =>
         {
@@ -574,7 +766,10 @@ fn git_subcommand_reason(sub: &str, rest: &[String], hooks_off: bool) -> Option<
                 || p.long("--force-with-lease")
                 || p.long("--force-if-includes")
                 || p.long("--mirror")
-                || p.operands.iter().any(|o| o.starts_with('+')) =>
+                || p.operands
+                    .iter()
+                    .chain(p.after_dashdash.iter())
+                    .any(|o| o.starts_with('+')) =>
         {
             FORCE_PUSH
         }
@@ -582,7 +777,7 @@ fn git_subcommand_reason(sub: &str, rest: &[String], hooks_off: bool) -> Option<
         "rebase" if p.short('i') || p.long("--interactive") => HISTORY_REWRITE,
         "reflog" if matches!(first, Some("expire" | "delete")) => HISTORY_REWRITE,
         "update-ref" if p.short('d') || p.long("--delete") => HISTORY_REWRITE,
-        "commit" if p.short('n') => HOOKS_OFF,
+        "commit" if p.short('n') => return (None, true),
         "config" => {
             let reads = [
                 "--get",
@@ -593,19 +788,19 @@ fn git_subcommand_reason(sub: &str, rest: &[String], hooks_off: bool) -> Option<
                 "--list",
             ];
             if reads.iter().any(|r| p.long(r)) || p.short('l') {
-                return None;
+                return (None, no_verify);
             }
-            let key = p.operands.iter().position(|o| names_hooks_path(o))?;
             // `git config core.hooksPath` reads; a value after the key sets it.
-            if key + 1 < p.operands.len() {
-                HOOKS_OFF
-            } else {
-                return None;
-            }
+            let sets = p
+                .operands
+                .iter()
+                .position(|o| names_hooks_path(o))
+                .is_some_and(|key| key + 1 < p.operands.len());
+            return (None, no_verify || sets);
         }
-        _ => return None,
+        _ => return (None, no_verify),
     };
-    Some(hit)
+    (Some(hit), no_verify)
 }
 
 fn rm_reason(args: &[String], via_xargs: bool, ctx: &Ctx<'_>) -> Option<Hit> {

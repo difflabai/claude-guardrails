@@ -494,7 +494,27 @@ fn file_operands<'a>(prog: &str, args: &'a [String]) -> Vec<&'a str> {
 /// cut out: they are data for the command they feed, except for a shell, whose body is a
 /// script and is returned as a part of its own.
 pub(crate) fn split_unquoted(text: &str) -> Vec<String> {
-    let mut parts: Vec<String> = Vec::new();
+    split_unquoted_ends(text)
+        .into_iter()
+        .map(|(p, _)| p)
+        .collect()
+}
+
+/// What ended a part of [`split_unquoted_ends`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PartEnd {
+    /// `;`, `&` or `|` (the character), or a newline (`'\n'`).
+    Op(char),
+    /// The part is a heredoc body that a shell runs as its script.
+    ShellHeredoc,
+    /// The end of the text.
+    End,
+}
+
+/// Like [`split_unquoted`], with what ended each part. `a && b` gives `a `, an empty part, and
+/// ` b`, both ended by `&`.
+pub(crate) fn split_unquoted_ends(text: &str) -> Vec<(String, PartEnd)> {
+    let mut parts: Vec<(String, PartEnd)> = Vec::new();
     let mut cur = String::new();
     let (mut single, mut double, mut escaped) = (false, false, false);
     let mut pending: Vec<String> = Vec::new(); // heredoc delimiters seen on this line
@@ -556,7 +576,7 @@ pub(crate) fn split_unquoted(text: &str) -> Vec<String> {
             '\n' if !single && !double => {
                 let first_word = cur.split_whitespace().next().unwrap_or("").to_string();
                 let feeds_shell = SHELLS.contains(&basename(&first_word));
-                parts.push(std::mem::take(&mut cur));
+                parts.push((std::mem::take(&mut cur), PartEnd::Op('\n')));
                 // consume heredoc bodies that begin on the next line
                 let mut k = i + 1;
                 for delim in pending.drain(..) {
@@ -575,7 +595,7 @@ pub(crate) fn split_unquoted(text: &str) -> Vec<String> {
                         body.push('\n');
                     }
                     if feeds_shell {
-                        parts.push(body);
+                        parts.push((body, PartEnd::ShellHeredoc));
                     }
                 }
                 let _ = line_parts_start;
@@ -584,13 +604,13 @@ pub(crate) fn split_unquoted(text: &str) -> Vec<String> {
                 continue;
             }
             ';' | '&' | '|' if !single && !double => {
-                parts.push(std::mem::take(&mut cur));
+                parts.push((std::mem::take(&mut cur), PartEnd::Op(ch)));
             }
             _ => cur.push(ch),
         }
         i += 1;
     }
-    parts.push(cur);
+    parts.push((cur, PartEnd::End));
     parts
 }
 
