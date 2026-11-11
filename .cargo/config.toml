@@ -1,0 +1,6 @@
+# The override tests change GUARDRAILS_DISABLED and GUARDRAILS_WARN_ONLY with
+# env::set_var. Process environment is shared by every test thread, so in parallel they
+# make unrelated tests see "disabled" and fail at random. One test thread keeps the
+# suite deterministic (about 3 s in total).
+[env]
+RUST_TEST_THREADS = "1"
