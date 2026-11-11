@@ -301,6 +301,193 @@ fn rm_home_is_a_critical_rule() {
 }
 
 // ---------------------------------------------------------------------------
+// QA round 1 (PR #2 @ be288371): every form below was denied on main or is a
+// way to delete the home directory that the first version let through.
+// ---------------------------------------------------------------------------
+
+/// P1-1: a backtick ends an operand, as `)` and `;` do. Denied on main.
+#[test]
+fn backtick_ends_the_home_operand() {
+    for cmd in [
+        "echo `rm -rf $HOME`",
+        "echo `rm -rf \"$HOME\"`",
+        "echo `rm -rf ~`",
+        "echo `rm -rf ~/`",
+        "echo `rm -rf ${HOME}`",
+        "echo `rm -rf /Users/someone`",
+        "echo `rm -rf /home/someone/`",
+        "echo `rm -rf ~/*`",
+        "echo \"`rm -rf ~`\"",
+    ] {
+        assert_rule(cmd, "rm-home");
+    }
+    // Inside `bash -c`: the string holds the backticks.
+    for cmd in [
+        "bash -c 'echo `rm -rf ~`'",
+        "bash -c 'echo `rm -rf $HOME`'",
+        "sh -c \"echo `rm -rf ${HOME}`\"",
+    ] {
+        let d = verdict(cmd);
+        assert!(d.is_deny(), "expected DENY for {cmd:?}, got {d:?}");
+    }
+    for text in ["bash -c 'echo `rm -rf ~`'", "bash -c 'x `rm -rf $HOME`'"] {
+        assert!(rule_matches("bash-c-rm-home", text), "{text:?}");
+    }
+    // A subpath in backticks is still a subpath.
+    assert_not_home_rule("echo `rm -rf ~/proj/build`");
+    assert_not_home_rule("echo `rm -rf $HOME/proj`");
+}
+
+/// P1-2: a `..` segment after the home name reaches the home directory or its
+/// parent. Denied on main for `$HOME` and `/home/x`; allowed on main and on the
+/// first version for `~` and `/Users/x`.
+#[test]
+fn dot_dot_after_the_home_name_matches() {
+    for cmd in [
+        "rm -rf $HOME/..",
+        "rm -rf /home/someone/..",
+        "rm -rf $HOME/build/..",
+        "rm -rf $HOME/build/../..",
+        "rm -rf ~/..",
+        "rm -rf ~/build/..",
+        "rm -rf ~/build/../",
+        "rm -rf ~/./..",
+        "rm -rf ~//..",
+        "rm -rf /Users/someone/..",
+        "rm -rf /Users/someone/../someone",
+        "rm -rf ${HOME}/..",
+        "rm -rf \"$HOME/..\"",
+        "rm -rf \"$HOME\"/..",
+        "rm -rf \"$HOME/build/..\"",
+        "rm -rf '/Users/someone/..'",
+        "rm -rf ~/.. ; ls",
+        "rm -rf ~/..&& ls",
+    ] {
+        assert_rule(cmd, "rm-home");
+    }
+    for cmd in [
+        "bash -c 'rm -rf ~/..'",
+        "bash -c 'rm -rf $HOME/build/..'",
+        "bash -c 'rm -rf $HOME/..'",
+        "bash -c 'rm -rf ${HOME}/../'",
+        "sh -c 'rm -rf \"$HOME/..\"'",
+    ] {
+        assert!(
+            rule_matches("bash-c-rm-home", cmd),
+            "{cmd:?} must match the rule"
+        );
+        let d = verdict(cmd);
+        assert!(d.is_deny(), "expected DENY for {cmd:?}, got {d:?}");
+    }
+}
+
+/// A name that merely starts with two dots, or has dots inside, is not `..`.
+#[test]
+fn dot_dot_look_alikes_are_subpaths() {
+    for cmd in [
+        "rm -rf ~/..foo",
+        "rm -rf ~/.../x",
+        "rm -rf ~/proj/a..b",
+        "rm -rf $HOME/proj/..hidden",
+        "rm -rf ~/proj/...",
+        "bash -c 'rm -rf ~/..foo'",
+        "bash -c 'rm -rf $HOME/proj/a..b'",
+    ] {
+        assert_not_home_rule(cmd);
+    }
+}
+
+/// P1-3: a quoted or escaped operand that holds `|`, `;`, `&` or `)` does not hide
+/// the home operand. The shell sees one word, so the rule must too.
+#[test]
+fn quoted_earlier_operand_does_not_hide_home() {
+    for home in [
+        "~",
+        "~/",
+        "~/*",
+        "$HOME",
+        "${HOME}",
+        "/home/alice",
+        "/Users/alice",
+    ] {
+        for first in [
+            "'old|backup'",
+            "'a;b'",
+            "\"a&b\"",
+            "'a)b'",
+            "a\\;b",
+            "a\\|b",
+            "\"a b\"",
+            "a\\ b",
+        ] {
+            let cmd = format!("rm -rf {first} {home}");
+            assert_rule(&cmd, "rm-home");
+        }
+    }
+    for cmd in [
+        "bash -c 'rm -rf \"a|b\" ~'",
+        "bash -c 'rm -rf \"a;b\" $HOME'",
+        "bash -c \"rm -rf 'a|b' ~\"",
+    ] {
+        assert!(
+            rule_matches("bash-c-rm-home", cmd),
+            "{cmd:?} must match the rule"
+        );
+        let d = verdict(cmd);
+        assert!(d.is_deny(), "expected DENY for {cmd:?}, got {d:?}");
+    }
+    // The quoted operand is not the home directory, so a subpath after it is fine.
+    assert_not_home_rule("rm -rf 'old|backup' ~/proj/build");
+    assert_not_home_rule("rm -rf 'a;b' $HOME/proj");
+    assert_not_home_rule("bash -c 'rm -rf \"a|b\" ~/proj'");
+}
+
+/// P2-1: brace and dot-glob spellings of all of the home directory's contents.
+#[test]
+fn brace_and_dot_glob_forms_of_all_contents_match() {
+    for cmd in [
+        "rm -rf $HOME/{*,.*}",
+        "rm -rf ~/{*,.*}",
+        "rm -rf ${HOME}/{*,.*}",
+        "rm -rf \"$HOME\"/{*,.*}",
+        "rm -rf /Users/someone/{*,.*}",
+        "rm -rf ~/{.[!.]*,*}",
+        "rm -rf ~/{.*,*}",
+        "rm -rf ~/.[!.]*",
+        "rm -rf ~/.[^.]*",
+        "rm -rf ~/..?*",
+        "rm -rf ~/.??*",
+        "rm -rf $HOME/.[!.]*",
+        "rm -rf $HOME/* $HOME/.[!.]*",
+    ] {
+        assert_rule(cmd, "rm-home");
+    }
+    for cmd in ["bash -c 'rm -rf $HOME/{*,.*}'", "bash -c 'rm -rf ~/.[!.]*'"] {
+        assert!(
+            rule_matches("bash-c-rm-home", cmd),
+            "{cmd:?} must match the rule"
+        );
+    }
+}
+
+/// Partial globs and named braces are subpaths.
+#[test]
+fn partial_braces_and_dot_globs_are_subpaths() {
+    for cmd in [
+        "rm -rf ~/{a,b}",
+        "rm -rf ~/{*.txt,*.log}",
+        "rm -rf $HOME/{proj,build}",
+        "rm -rf ~/.[!.]*rc",
+        "rm -rf ~/.[a-z]*",
+        "rm -rf ~/{*,.*}/x",
+        "rm -rf $HOME/proj/{*,.*}",
+        "bash -c 'rm -rf ~/{a,b}'",
+    ] {
+        assert_not_home_rule(cmd);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // bash-c-rm-home: the same rule inside `sh -c '...'`
 // ---------------------------------------------------------------------------
 
