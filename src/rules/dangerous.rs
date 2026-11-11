@@ -17,7 +17,13 @@ pub const CRITICAL_RULES: &[Rule] = &[
     Rule::new(
         "rm-home",
         SafetyLevel::Critical,
-        r"\brm\s+(-[rfv]+\s+)*(~|\$HOME|/home/\w+)\b",
+        // The home directory itself and all its contents, never a real subpath:
+        //   ~  ~/  ~/*  ~name  $HOME  ${HOME}  "$HOME"  "$HOME/"  /home/u  /Users/u
+        // each with or without a trailing `/` or `/*`, then end of text, whitespace,
+        // `;`, `&`, `|` or `)`. Any operand of rm can be the home directory. A quote after
+        // the name only counts when the name was quoted (`"$HOME"`), so `echo "rm ~"`
+        // is not a match. `~` and `$HOME` are literal in the wrong quotes: `'~'` is not.
+        r#"\brm\s+(?:[^\s;&|)]+\s+)*?(?:(?:~[A-Za-z0-9_.-]*|\$HOME|\$\{HOME\}|/home/[^/\s"';&|)]+|/Users/[^/\s"';&|)]+)(?:/\*?)?|"(?:\$HOME|\$\{HOME\}|/home/[^/\s"';&|)]+|/Users/[^/\s"';&|)]+)(?:/\*?)?"(?:/\*?)?|'(?:/home/[^/\s"';&|)]+|/Users/[^/\s"';&|)]+)(?:/\*?)?'(?:/\*?)?)(?:\s|;|&|\||\)|$)"#,
         "Attempting to delete home directory",
     ),
     Rule::new(
@@ -36,7 +42,7 @@ pub const CRITICAL_RULES: &[Rule] = &[
     Rule::new(
         "dd-disk-device",
         SafetyLevel::Critical,
-        r"\bdd\b.*\bof=/dev/(sd|nvme|hd|vd|xvd)[a-z]",
+        r"\bdd\b.*\bof=/dev/(sd|nvme|hd|vd|xvd)[a-z0-9]",
         "Writing directly to disk device",
     ),
     Rule::new(
@@ -221,7 +227,9 @@ pub const HIGH_RULES: &[Rule] = &[
     Rule::new(
         "bash-c-rm-home",
         SafetyLevel::High,
-        r#"\b(ba)?sh\s+-c\s+['"].*\brm\s+(-[rf]+\s+)*(~|\$HOME)"#,
+        // Same targets as rm-home, inside a quoted `-c` string: the closing quote ends the
+        // name, so `bash -c 'rm -rf ~'` matches and `bash -c 'echo rm $HOMEDIR'` does not.
+        r#"\b(ba)?sh\s+-c\s+['"].*\brm\s+(?:[^\s;&|)'"]+\s+)*?(?:(?:~[A-Za-z0-9_.-]*|\$HOME|\$\{HOME\})(?:/\*?)?|"(?:\$HOME|\$\{HOME\})(?:/\*?)?")(?:\s|;|&|\||\)|['"]|$)"#,
         "Shell -c with rm targeting home directory",
     ),
     Rule::new(
