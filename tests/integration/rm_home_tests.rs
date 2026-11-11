@@ -245,13 +245,26 @@ fn bash_c_home_forms_match() {
         "bash -c 'rm -rf ${HOME}/*'",
         "bash -c 'cd /tmp && rm -rf ~'",
         "bash -c 'echo hi; rm -rf ~; echo done'",
-        "bash -c 'rm -rf /Users/someone'",
-        "bash -c 'rm -rf /home/someone/'",
         "bash -c 'rm -Rf ~'",
+        "bash -c 'rm -rf \"$HOME\"'",
     ] {
         let d = verdict(cmd);
         assert!(d.is_deny(), "expected DENY for {cmd:?}, got {d:?}");
         assert_eq!(d.rule_id(), Some("bash-c-rm-home"), "{cmd:?}: {d:?}");
+    }
+}
+
+#[test]
+fn bash_c_absolute_home_is_denied() {
+    // `bash-c-dangerous` (any `rm` of an absolute path) fires first; the point is that
+    // the command is denied, whichever rule names it.
+    for cmd in [
+        "bash -c 'rm -rf /Users/someone'",
+        "bash -c 'rm -rf /home/someone/'",
+        "bash -c 'rm -rf /Users/someone/*'",
+    ] {
+        let d = verdict(cmd);
+        assert!(d.is_deny(), "expected DENY for {cmd:?}, got {d:?}");
     }
 }
 
