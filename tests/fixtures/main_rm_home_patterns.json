@@ -1,0 +1,4 @@
+{
+ "rm-home": "\\brm\\s+(-[rfv]+\\s+)*(~|\\$HOME|/home/\\w+)\\b",
+ "bash-c-rm-home": "\\b(ba)?sh\\s+-c\\s+['\"].*\\brm\\s+(-[rf]+\\s+)*(~|\\$HOME)"
+}

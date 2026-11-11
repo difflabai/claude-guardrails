@@ -1,11 +1,15 @@
-//! steward-l8b3: rm-home and bash-c-rm-home.
+//! steward-l8b3, round 3: rm-home and bash-c-rm-home are main's regexes, unchanged,
+//! with an AST check OR'd on top. The PR may only ADD denials.
 //!
-//! `rm-home` is a Critical rule: it must match the home directory itself and all its
-//! contents, in every spelling, and must not match a real subpath such as
-//! `~/proj/build` (a false Critical block costs more than it saves).
+//! * `main_regexes_are_main_text`: the two patterns are byte-for-byte main's.
+//! * `every_command_main_denies_is_still_denied`: a corpus of commands that main
+//!   denies, recorded from main's own engine at three safety levels, is denied at head
+//!   by the same rule at the same level.
+//! * the rest: commands that delete the home directory and that main (or round 1 or
+//!   round 2 of this PR) let through, each through every wrapper.
 //!
-//! Each form is tested both ways: the rule fires, and it does not fire on the
-//! neighbouring subpath or look-alike name.
+//! All tests go through `SecurityEngine::check_bash`, the entry the hook binary uses,
+//! with the real tree-sitter-bash parser and the real rule set.
 
 use claude_guardrails::rules::dangerous;
 use claude_guardrails::{Config, Decision, SafetyLevel, SecurityEngine};
@@ -16,32 +20,26 @@ fn engine_at(level: SafetyLevel) -> SecurityEngine {
     SecurityEngine::new(config)
 }
 
+const LEVELS: [SafetyLevel; 3] = [
+    SafetyLevel::Critical,
+    SafetyLevel::High,
+    SafetyLevel::Strict,
+];
+
 fn verdict(command: &str) -> Decision {
     engine_at(SafetyLevel::High).check_bash(command)
 }
 
+/// Denied at every safety level: rm-home is a Critical rule.
 #[track_caller]
-fn assert_rule(command: &str, rule_id: &str) {
-    let d = verdict(command);
-    assert!(
-        d.is_deny(),
-        "expected DENY by {rule_id} for {command:?}, got {d:?}"
-    );
-    assert_eq!(
-        d.rule_id(),
-        Some(rule_id),
-        "wrong rule for {command:?}: {d:?}"
-    );
-}
-
-/// Not denied by `rm-home` or `bash-c-rm-home`. Other rules are not the subject here.
-#[track_caller]
-fn assert_not_home_rule(command: &str) {
-    let d = verdict(command);
-    assert!(
-        !matches!(d.rule_id(), Some("rm-home") | Some("bash-c-rm-home")),
-        "{command:?} must not be a home-directory deny, got {d:?}"
-    );
+fn assert_denied_everywhere(command: &str) {
+    for level in LEVELS {
+        let d = engine_at(level).check_bash(command);
+        assert!(
+            d.is_deny(),
+            "expected DENY at {level:?} for {command:?}, got {d:?}"
+        );
+    }
 }
 
 #[track_caller]
@@ -51,533 +49,598 @@ fn assert_allowed(command: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// rm-home: the home directory and all its contents
+// The union: main's text, and everything main denies.
 // ---------------------------------------------------------------------------
 
-#[test]
-fn tilde_forms_match() {
-    for cmd in [
-        "rm -rf ~",
-        "rm -rf ~/",
-        "rm -rf ~/*",
-        "rm -r ~",
-        "rm -fr ~/",
-        "rm ~",
-        "rm -rf ~root",
-    ] {
-        assert_rule(cmd, "rm-home");
-    }
-}
-
-#[test]
-fn home_variable_forms_match() {
-    for cmd in [
-        "rm -rf $HOME",
-        "rm -rf $HOME/",
-        "rm -rf $HOME/*",
-        "rm -rf ${HOME}",
-        "rm -rf ${HOME}/",
-        "rm -rf ${HOME}/*",
-        "rm -rf \"$HOME\"",
-        "rm -rf \"$HOME/\"",
-        "rm -rf \"$HOME/*\"",
-        "rm -rf \"$HOME\"/",
-        "rm -rf \"$HOME\"/*",
-        "rm -rf \"${HOME}\"",
-        "rm -rf \"${HOME}/\"",
-    ] {
-        assert_rule(cmd, "rm-home");
-    }
-}
-
-#[test]
-fn absolute_home_forms_match() {
-    for cmd in [
-        "rm -rf /home/someone",
-        "rm -rf /home/someone/",
-        "rm -rf /home/someone/*",
-        "rm -rf /Users/someone",
-        "rm -rf /Users/someone/",
-        "rm -rf /Users/someone/*",
-        "rm -rf \"/Users/someone\"",
-        "rm -rf '/Users/someone/'",
-        "rm -rf \"/home/someone/\"",
-    ] {
-        assert_rule(cmd, "rm-home");
-    }
-}
-
-#[test]
-fn spellings_of_the_directory_and_all_its_contents_match() {
-    for cmd in [
-        "rm -rf ~//",
-        "rm -rf ~/.",
-        "rm -rf ~/./",
-        "rm -rf ~/**",
-        "rm -rf ~/.*",
-        "rm -rf ~/*/",
-        "rm -rf $HOME//",
-        "rm -rf $HOME/.",
-        "rm -rf $HOME/.*",
-        "rm -rf ${HOME}/**",
-        "rm -rf \"$HOME/.\"",
-        "rm -rf /Users/someone/.",
-        "rm -rf /Users/someone//",
-        "rm -rf /home/someone/.*",
-    ] {
-        assert_rule(cmd, "rm-home");
-    }
-}
-
-#[test]
-fn partial_globs_and_dot_names_are_subpaths() {
-    for cmd in [
-        "rm -rf ~/*.txt",
-        "rm -rf ~/.cache",
-        "rm -rf ~/.*rc",
-        "rm -rf ~/..foo",
-        "rm -rf $HOME/*.log",
-        "rm -rf $HOME/.cache",
-        "rm -rf /Users/someone/*.o",
-    ] {
-        assert_not_home_rule(cmd);
-    }
-}
-
-#[test]
-fn each_form_is_followed_by_a_terminator() {
-    // End of line, whitespace, ; & | or ).
-    for cmd in [
-        "rm -rf ~\n",
-        "rm -rf ~ ",
-        "rm -rf ~ other",
-        "rm -rf ~; ls",
-        "rm -rf ~;",
-        "rm -rf ~ && ls",
-        "rm -rf ~&& ls",
-        "rm -rf ~ & ls",
-        "rm -rf ~ | cat",
-        "rm -rf ~| cat",
-        "(rm -rf ~)",
-        "rm -rf $HOME;ls",
-        "rm -rf $HOME)",
-        "rm -rf ${HOME}|cat",
-        "rm -rf /Users/someone&ls",
-    ] {
-        assert_rule(cmd, "rm-home");
-    }
-}
-
-#[test]
-fn flag_spellings_and_wrappers_match() {
-    for cmd in [
-        "rm -Rf ~",
-        "rm -rfv ~/",
-        "rm -r -f ~",
-        "rm --recursive --force ~",
-        "rm -rf -- ~",
-        "rm -rf --no-preserve-root ~",
-        "sudo rm -rf ~",
-        "/bin/rm -rf ~",
-        "timeout 30 rm -rf ~",
-        "cd /tmp && rm -rf ~",
-    ] {
-        assert_rule(cmd, "rm-home");
-    }
-}
-
-#[test]
-fn home_as_a_later_operand_matches() {
-    // The home directory is deleted whichever operand names it.
-    assert_rule("rm -rf build ~", "rm-home");
-    assert_rule("rm -rf ./a ./b $HOME/", "rm-home");
-    assert_rule("rm -rf ~/proj ~", "rm-home");
-}
-
-#[test]
-fn real_subpaths_do_not_match() {
-    for cmd in [
-        "rm -rf ~/proj/build",
-        "rm -rf ~/proj",
-        "rm -rf ~/proj/",
-        "rm -rf ~/.cache/x",
-        "rm -rf ~/proj/*",
-        "rm -rf ~user/proj",
-        "rm -rf $HOME/proj/build",
-        "rm -rf $HOME/proj/*",
-        "rm -rf ${HOME}/proj/build",
-        "rm -rf \"$HOME/proj/build\"",
-        "rm -rf \"$HOME\"/proj/build",
-        "rm -rf /Users/someone/proj/build",
-        "rm -rf /home/someone/proj/build",
-        "rm -rf /Users/someone/proj/*",
-        "rm ~/old.txt",
-        "rm ~/proj/a.txt ~/proj/b.txt",
-    ] {
-        assert_not_home_rule(cmd);
-    }
-}
-
-#[test]
-fn look_alike_names_do_not_match() {
-    for cmd in [
-        "rm -rf $HOME_BACKUP",
-        "rm -rf $HOMEDIR",
-        "rm -rf ${HOME}_old",
-        "rm -rf ~~",
-        "rm -rf /Users",
-        "rm -rf /home",
-        "rm -rf /Users/",
-        "rm -rf /homework/x",
-        "rm -rf $HOMES",
-    ] {
-        assert_not_home_rule(cmd);
-    }
-}
-
-/// The pattern of one rule, to test the rule on its own. The engine also checks the
-/// command with its quotes removed (wrapper unwrapping), so a quote-sensitive rule
-/// cannot be tested through the engine.
-fn rule_matches(rule_id: &str, text: &str) -> bool {
-    let rules = dangerous::get_rules_for_level(SafetyLevel::Strict);
-    let rule = rules
+fn pattern_of(rule_id: &str) -> &'static str {
+    dangerous::get_rules_for_level(SafetyLevel::Strict)
         .iter()
         .find(|r| r.id == rule_id)
-        .unwrap_or_else(|| panic!("no rule {rule_id}"));
-    regex::Regex::new(rule.pattern).unwrap().is_match(text)
+        .unwrap_or_else(|| panic!("no rule {rule_id}"))
+        .pattern
 }
 
 #[test]
-fn rm_home_pattern_honours_quotes() {
-    // Quoted tilde and single-quoted variable are literal names: not the home directory.
-    for text in [
-        "rm -rf \"~\"",
-        "rm -rf '~'",
-        "rm -rf '$HOME'",
-        "rm -rf \"~/\"",
-    ] {
-        assert!(!rule_matches("rm-home", text), "{text:?} must not match");
-    }
-    // A quote after the name only counts when the name was quoted: prose is not a match.
-    for text in [
-        "echo \"never rm $HOME\"",
-        "echo \"never rm ~\"",
-        "git commit -m \"docs: warn about rm ~\"",
-    ] {
-        assert!(!rule_matches("rm-home", text), "{text:?} must not match");
-    }
-    // The quoted spellings that do name the home directory.
-    for text in [
-        "rm -rf \"$HOME\"",
-        "rm -rf \"${HOME}/\"",
-        "rm -rf '/Users/someone'",
-    ] {
-        assert!(rule_matches("rm-home", text), "{text:?} must match");
+fn main_regexes_are_main_text() {
+    // Recorded from `git show origin/main:src/rules/dangerous.rs`.
+    let main: serde_json::Value =
+        serde_json::from_str(include_str!("../fixtures/main_rm_home_patterns.json")).unwrap();
+    for id in ["rm-home", "bash-c-rm-home"] {
+        assert_eq!(
+            pattern_of(id),
+            main[id].as_str().unwrap(),
+            "{id} must be main's text; the AST check is the addition"
+        );
     }
 }
 
 #[test]
-fn safe_rm_still_allowed() {
-    assert_allowed("rm -rf ./node_modules");
-    assert_allowed("rm file.txt");
-    assert_allowed("rm -rf ~/proj/build");
-    assert_allowed("rm -rf $HOME/proj/build");
+fn every_command_main_denies_is_still_denied() {
+    // One JSON object per line: the command and main's verdict at Critical, High and
+    // Strict (the rule id, or null for allow). The corpus crosses about 250 targets
+    // (home spellings, subpaths, look-alikes, hidden operands) with 8 flag spellings
+    // and 36 wrappers and keeps every fourth command main denies.
+    let engines: Vec<SecurityEngine> = LEVELS.iter().map(|l| engine_at(*l)).collect();
+    let mut checked = 0;
+    for line in include_str!("../fixtures/main_denied.jsonl").lines() {
+        let row: serde_json::Value = serde_json::from_str(line).unwrap();
+        let cmd = row["cmd"].as_str().unwrap();
+        for (i, level) in LEVELS.iter().enumerate() {
+            let Some(main_rule) = row["v"][i].as_str() else {
+                continue;
+            };
+            let d = engines[i].check_bash(cmd);
+            assert_eq!(
+                d.rule_id(),
+                Some(main_rule),
+                "{level:?}: main denies {cmd:?} by {main_rule}, head says {d:?}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 5000, "fixture shrank: {checked} verdicts");
 }
 
 #[test]
-fn rm_home_is_a_critical_rule() {
-    // Active at every level, including Critical.
-    let engine = engine_at(SafetyLevel::Critical);
+fn main_denied_subpaths_stay_denied() {
+    // Rounds 1 and 2 allowed these. Main denies them, so they stay denied: an
+    // add-only change does not decide which subpaths are safe to delete.
     for cmd in [
-        "rm -rf ~",
-        "rm -rf ~/",
-        "rm -rf $HOME",
-        "rm -rf /Users/someone",
+        "rm -rf $HOME/proj",
+        "rm -rf $HOME/proj/build",
+        "rm -rf \"$HOME/proj/build\"",
+        "rm -rf \"$HOME\"/proj/build",
+        "rm -rf /home/alice/proj",
+        "rm -rf /home/alice/proj/build",
+        "rm -rf ~alice/proj",
+        "rm -rf $HOME-old",
+        "bash -c 'rm -rf $HOME/proj/build'",
+        "bash -c 'rm -rf ~user/proj'",
+        "echo \"rm $HOME\"",
     ] {
-        let d = engine.check_bash(cmd);
-        assert_eq!(d.rule_id(), Some("rm-home"), "{cmd:?}: {d:?}");
+        assert_denied_everywhere(cmd);
     }
-    assert!(engine.check_bash("rm -rf ~/proj/build").is_allow());
+    // `bash-c-rm-home` is a High rule: denied at High and Strict, as on main.
+    for cmd in ["bash -c 'rm -rf ~/build'", "bash -c 'rm -rf $HOMEDIR'"] {
+        for level in [SafetyLevel::High, SafetyLevel::Strict] {
+            let d = engine_at(level).check_bash(cmd);
+            assert_eq!(
+                d.rule_id(),
+                Some("bash-c-rm-home"),
+                "{level:?} {cmd:?}: {d:?}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
-// QA round 1 (PR #2 @ be288371): every form below was denied on main or is a
-// way to delete the home directory that the first version let through.
+// Must deny: the home directory, in every spelling, through every wrapper.
 // ---------------------------------------------------------------------------
 
-/// P1-1: a backtick ends an operand, as `)` and `;` do. Denied on main.
+const HOME_FORMS: &[&str] = &[
+    "~",
+    "~/",
+    "~//",
+    "~/.",
+    "~/*",
+    "~/.*",
+    "$HOME",
+    "$HOME/",
+    "\"$HOME\"",
+    "\"$HOME/\"",
+    "${HOME}",
+    "${HOME}/",
+    "\"${HOME}\"",
+    "/Users/alice",
+    "/Users/alice/",
+    "'/Users/alice'",
+    "/home/alice",
+    "/home/alice/",
+    "$HOME/..",
+    "~/..",
+    "/Users/alice/..",
+    "$HOME/{,}",
+    "~/{build,}",
+    "~/*(D)",
+    "$HOME/./*",
+];
+
+const FLAGS: &[&str] = &[
+    "",
+    "-rf ",
+    "-fr ",
+    "-r -f ",
+    "--recursive --force ",
+    "-Rf ",
+    "-rf -- ",
+];
+
+/// `{}` is the rm command line.
+const WRAPPERS: &[&str] = &[
+    "{}",
+    "\\{}",
+    "/bin/{}",
+    "/usr/bin/{}",
+    "command {}",
+    "command -p {}",
+    "builtin {}",
+    "exec {}",
+    "sudo {}",
+    "sudo -u root {}",
+    "env {}",
+    "env X=1 {}",
+    "nohup {}",
+    "noglob {}",
+    "time {}",
+    "timeout 30 {}",
+    "cd /tmp && {}",
+    "echo `{}`",
+    "echo $({})",
+    "x=`{}`",
+    "echo \"`{}`\"",
+    "echo \"$({})\"",
+    "bash -c '{}'",
+    "sh -c '{}'",
+    "zsh -c '{}'",
+    "bash -lc '{}'",
+    "bash -c -- '{}'",
+    "eval '{}'",
+    "{ {}; }",
+    "({})",
+    "if true; then {}; fi",
+    "{} >/dev/null",
+    "{}>/dev/null",
+    "{} 2>&1",
+    "{}; echo ok",
+    "{} && echo ok",
+    "{} | cat",
+    "{} &",
+    "{} # c",
+];
+
 #[test]
-fn backtick_ends_the_home_operand() {
+fn home_is_denied_through_every_wrapper() {
+    let engines: Vec<SecurityEngine> = LEVELS.iter().map(|l| engine_at(*l)).collect();
+    let mut checked = 0;
+    for form in HOME_FORMS {
+        for flags in FLAGS {
+            for wrapper in WRAPPERS {
+                let rm = format!("rm {flags}{form}");
+                let cmd = wrapper.replace("{}", &rm);
+                for (i, level) in LEVELS.iter().enumerate() {
+                    let d = engines[i].check_bash(&cmd);
+                    assert!(
+                        d.is_deny(),
+                        "{level:?}: expected DENY for {cmd:?}, got {d:?}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(checked > 10_000);
+}
+
+#[test]
+fn the_brief_forms_through_the_brief_wrappers() {
+    for target in [
+        "~",
+        "~/",
+        "$HOME",
+        "\"$HOME\"",
+        "${HOME}/",
+        "/Users/someone",
+    ] {
+        for cmd in [
+            format!("rm -rf {target}"),
+            format!("\\rm -rf {target}"),
+            format!("/bin/rm -rf {target}"),
+            format!("command rm -rf {target}"),
+            format!("builtin rm -rf {target}"),
+            format!("exec rm -rf {target}"),
+            format!("bash -c 'rm -rf {target}'"),
+            format!("sh -c 'rm -rf {target}'"),
+            format!("zsh -c 'rm -rf {target}'"),
+            format!("bash -lc 'rm -rf {target}'"),
+            format!("echo `rm -rf {target}`"),
+            format!("echo $(rm -rf {target})"),
+        ] {
+            assert_denied_everywhere(&cmd);
+        }
+    }
+}
+
+#[test]
+fn quoted_and_escaped_spellings_of_the_command_and_target_are_decoded() {
     for cmd in [
+        "\"rm\" -rf ~",
+        "'rm' -rf ~",
+        "r\\m -rf ~",
+        "r\"\"m -rf ~",
+        "$'rm' -rf ~",
+        "bash -c '\"rm\" -rf ~'",
+        "bash -c 'r\\m -rf $HOME'",
+        "eval '\"rm\" -rf ~'",
+        "rm -rf $'/home/alice/'",
+        "rm -rf $'\\x2fUsers/alice/'",
+        "rm -rf $HOME/$'..'/*",
+        "rm -rf $HOME/$'\\x2e\\x2e'/*",
+        "rm -rf ~/$'..'",
+        "rm -rf \"$HOME\"/'..'/*",
+        "rm -rf $HOME\"\"",
+        "rm -rf $HOME\\/",
+        "rm -rf \"\"$HOME",
+        "rm -rf \"$HOME\"''/",
+        "rm -rf ~/\"..\"",
+        "rm -rf ~/'..'",
+        "rm -rf ~/\\.\\.",
+    ] {
+        assert_denied_everywhere(cmd);
+    }
+}
+
+#[test]
+fn literal_tilde_in_the_wrong_quotes_is_not_the_home() {
+    // `$'~'` and `'~'` are the literal text, a relative file name.
+    for cmd in ["rm -rf '~'", "rm -rf $'~'", "rm -rf \"~\"", "rm -rf \\~"] {
+        assert_allowed(cmd);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Round 1 of PR #2 (qa-gate-ruff2 and Codex), all denied.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn round1_rows_stay_denied() {
+    for cmd in [
+        // P1-1 backticks
         "echo `rm -rf $HOME`",
         "echo `rm -rf \"$HOME\"`",
         "echo `rm -rf ~`",
         "echo `rm -rf ~/`",
         "echo `rm -rf ${HOME}`",
         "echo `rm -rf /Users/someone`",
-        "echo `rm -rf /home/someone/`",
-        "echo `rm -rf ~/*`",
-        "echo \"`rm -rf ~`\"",
-    ] {
-        assert_rule(cmd, "rm-home");
-    }
-    // Inside `bash -c`: the string holds the backticks.
-    for cmd in [
         "bash -c 'echo `rm -rf ~`'",
-        "bash -c 'echo `rm -rf $HOME`'",
-        "sh -c \"echo `rm -rf ${HOME}`\"",
-    ] {
-        let d = verdict(cmd);
-        assert!(d.is_deny(), "expected DENY for {cmd:?}, got {d:?}");
-    }
-    for text in ["bash -c 'echo `rm -rf ~`'", "bash -c 'x `rm -rf $HOME`'"] {
-        assert!(rule_matches("bash-c-rm-home", text), "{text:?}");
-    }
-    // A subpath in backticks is still a subpath.
-    assert_not_home_rule("echo `rm -rf ~/proj/build`");
-    assert_not_home_rule("echo `rm -rf $HOME/proj`");
-}
-
-/// P1-2: a `..` segment after the home name reaches the home directory or its
-/// parent. Denied on main for `$HOME` and `/home/x`; allowed on main and on the
-/// first version for `~` and `/Users/x`.
-#[test]
-fn dot_dot_after_the_home_name_matches() {
-    for cmd in [
+        // P1-2 dot-dot
         "rm -rf $HOME/..",
-        "rm -rf /home/someone/..",
+        "rm -rf /home/x/..",
         "rm -rf $HOME/build/..",
         "rm -rf $HOME/build/../..",
         "rm -rf ~/..",
         "rm -rf ~/build/..",
-        "rm -rf ~/build/../",
-        "rm -rf ~/./..",
-        "rm -rf ~//..",
-        "rm -rf /Users/someone/..",
-        "rm -rf /Users/someone/../someone",
-        "rm -rf ${HOME}/..",
-        "rm -rf \"$HOME/..\"",
-        "rm -rf \"$HOME\"/..",
-        "rm -rf \"$HOME/build/..\"",
-        "rm -rf '/Users/someone/..'",
-        "rm -rf ~/.. ; ls",
-        "rm -rf ~/..&& ls",
-    ] {
-        assert_rule(cmd, "rm-home");
-    }
-    for cmd in [
+        "rm -rf /Users/lee/..",
+        "rm -rf /Users/lee/../lee",
         "bash -c 'rm -rf ~/..'",
-        "bash -c 'rm -rf $HOME/build/..'",
-        "bash -c 'rm -rf $HOME/..'",
-        "bash -c 'rm -rf ${HOME}/../'",
-        "sh -c 'rm -rf \"$HOME/..\"'",
-    ] {
-        assert!(
-            rule_matches("bash-c-rm-home", cmd),
-            "{cmd:?} must match the rule"
-        );
-        let d = verdict(cmd);
-        assert!(d.is_deny(), "expected DENY for {cmd:?}, got {d:?}");
-    }
-}
-
-/// A name that merely starts with two dots, or has dots inside, is not `..`.
-#[test]
-fn dot_dot_look_alikes_are_subpaths() {
-    for cmd in [
-        "rm -rf ~/..foo",
-        "rm -rf ~/.../x",
-        "rm -rf ~/proj/a..b",
-        "rm -rf $HOME/proj/..hidden",
-        "rm -rf ~/proj/...",
-        "bash -c 'rm -rf ~/..foo'",
-        "bash -c 'rm -rf $HOME/proj/a..b'",
-    ] {
-        assert_not_home_rule(cmd);
-    }
-}
-
-/// P1-3: a quoted or escaped operand that holds `|`, `;`, `&` or `)` does not hide
-/// the home operand. The shell sees one word, so the rule must too.
-#[test]
-fn quoted_earlier_operand_does_not_hide_home() {
-    for home in [
-        "~",
-        "~/",
-        "~/*",
-        "$HOME",
-        "${HOME}",
-        "/home/alice",
-        "/Users/alice",
-    ] {
-        for first in [
-            "'old|backup'",
-            "'a;b'",
-            "\"a&b\"",
-            "'a)b'",
-            "a\\;b",
-            "a\\|b",
-            "\"a b\"",
-            "a\\ b",
-        ] {
-            let cmd = format!("rm -rf {first} {home}");
-            assert_rule(&cmd, "rm-home");
-        }
-    }
-    for cmd in [
+        // P1-3 quoted earlier operand
+        "rm -rf 'old|backup' ~",
+        "rm -rf 'old|backup' ~/",
+        "rm -rf 'old|backup' ~/*",
+        "rm -rf 'old|backup' $HOME",
+        "rm -rf 'old|backup' ${HOME}",
+        "rm -rf 'old|backup' /home/alice",
+        "rm -rf 'old|backup' /Users/alice",
+        "rm -rf 'a;b' ~",
+        "rm -rf \"a&b\" ~",
+        "rm -rf 'a)b' ~",
+        "rm -rf a\\;b ~",
+        "rm -rf a\\|b ~",
         "bash -c 'rm -rf \"a|b\" ~'",
-        "bash -c 'rm -rf \"a;b\" $HOME'",
-        "bash -c \"rm -rf 'a|b' ~\"",
-    ] {
-        assert!(
-            rule_matches("bash-c-rm-home", cmd),
-            "{cmd:?} must match the rule"
-        );
-        let d = verdict(cmd);
-        assert!(d.is_deny(), "expected DENY for {cmd:?}, got {d:?}");
-    }
-    // The quoted operand is not the home directory, so a subpath after it is fine.
-    assert_not_home_rule("rm -rf 'old|backup' ~/proj/build");
-    assert_not_home_rule("rm -rf 'a;b' $HOME/proj");
-    assert_not_home_rule("bash -c 'rm -rf \"a|b\" ~/proj'");
-}
-
-/// P2-1: brace and dot-glob spellings of all of the home directory's contents.
-#[test]
-fn brace_and_dot_glob_forms_of_all_contents_match() {
-    for cmd in [
+        // P2-1 braces and dot globs
         "rm -rf $HOME/{*,.*}",
         "rm -rf ~/{*,.*}",
-        "rm -rf ${HOME}/{*,.*}",
-        "rm -rf \"$HOME\"/{*,.*}",
-        "rm -rf /Users/someone/{*,.*}",
-        "rm -rf ~/{.[!.]*,*}",
-        "rm -rf ~/{.*,*}",
         "rm -rf ~/.[!.]*",
         "rm -rf ~/.[^.]*",
         "rm -rf ~/..?*",
         "rm -rf ~/.??*",
-        "rm -rf $HOME/.[!.]*",
-        "rm -rf $HOME/* $HOME/.[!.]*",
     ] {
-        assert_rule(cmd, "rm-home");
-    }
-    for cmd in ["bash -c 'rm -rf $HOME/{*,.*}'", "bash -c 'rm -rf ~/.[!.]*'"] {
-        assert!(
-            rule_matches("bash-c-rm-home", cmd),
-            "{cmd:?} must match the rule"
-        );
+        assert_denied_everywhere(cmd);
     }
 }
 
-/// Partial globs and named braces are subpaths.
+// ---------------------------------------------------------------------------
+// Round 2 of PR #2: ruff3's classes and Codex's round-2 list.
+// ---------------------------------------------------------------------------
+
+/// ruff3 P1-A: an earlier substitution hides the home operand.
 #[test]
-fn partial_braces_and_dot_globs_are_subpaths() {
+fn round2_earlier_substitution_operand() {
     for cmd in [
+        "rm -rf `printf old` $HOME",
+        "rm -rf `mktemp` ~",
+        "rm -rf `mktemp -d` ~",
+        "rm -rf x`printf old` /Users/alice",
+        "bash -c 'rm -rf `printf old` $HOME'",
+        "bash -c 'rm -rf `printf old` ~'",
+        "rm -rf $(printf old) ${HOME}",
+        "rm -rf $(mktemp -d) ~",
+        "rm -rf $(printf old)x ~",
+        "rm -rf <(true) ~",
+        "bash -c 'rm -rf $(printf old) ${HOME}'",
+    ] {
+        assert_denied_everywhere(cmd);
+    }
+}
+
+/// ruff3 P1-B: a brace with an empty arm gives back the home itself.
+#[test]
+fn round2_brace_with_an_empty_arm() {
+    for cmd in [
+        "rm -rf $HOME/{,}",
+        "rm -rf $HOME{,}",
+        "rm -rf $HOME/{build,}",
+        "rm -rf $HOME/{build,dist,}",
+        "rm -rf $HOME/{,build}",
+        "rm -rf \"$HOME\"/{,}",
+        "rm -rf \"$HOME\"{,/}",
+        "rm -rf \"$HOME/\"{,}",
+        "bash -c 'rm -rf $HOME/{,}'",
+        "rm -rf ~/{,}",
+        "rm -rf ~{,}",
+        "rm -rf ~/{build,}",
+        "rm -rf ~/{build,dist,}",
+        "rm -rf ~/{.,}",
+        "rm -rf /Users/lee/{build,}",
+        "rm -rf /home/x{,}",
+        "rm -rf ~/{a,{b,}}",
+    ] {
+        assert_denied_everywhere(cmd);
+    }
+}
+
+/// ruff3 P1-C: a redirection with no space before it, top level and inside `-c`.
+#[test]
+fn round2_redirection_without_a_space() {
+    for cmd in [
+        "bash -c 'rm -rf $HOME>/dev/null'",
+        "bash -c 'rm -rf $HOME>/dev/null 2>&1'",
+        "eval 'rm -rf /home/x>/dev/null'",
+        "bash -c 'rm -rf ~/>/dev/null'",
+        "bash -c 'rm -rf ~/*>/dev/null'",
+        "rm -rf $HOME>/dev/null",
+        "rm -rf ~>/dev/null",
+        "rm -rf ~/>/dev/null",
+        "rm -rf ~<in",
+        "rm -rf ~>>log",
+        "rm -rf /Users/lee>/dev/null",
+        "rm -rf ${HOME}/</dev/null",
+        "rm -rf /Users/alice/<<EOF\nEOF",
+    ] {
+        assert_denied_everywhere(cmd);
+    }
+}
+
+/// ruff3 P2-a: other globs for all of the contents.
+#[test]
+fn round2_other_content_globs() {
+    for cmd in [
+        "rm -rf $HOME/./*",
+        "rm -rf $HOME/?*",
+        "rm -rf $HOME/**/*",
+        "rm -rf $HOME/*(D)",
+        "bash -c 'rm -rf $HOME/./*'",
+        "bash -c 'rm -rf $HOME/?*'",
+        "rm -rf ~/./*",
+        "rm -rf ${HOME}/././*",
+        "rm -rf ~/?*",
+        "rm -rf ~/[!.]*",
+        "rm -rf ~/[^.]*",
+        "rm -rf ~/*(D)",
+        "rm -rf ~/*(D)/",
+        "rm -rf ~/*(N)",
+        "rm -rf ~/**(D)",
+        "rm -rf ~/{*,{.[!.]*,..?*}}",
+        "rm -rf ~/**/*",
+    ] {
+        assert_denied_everywhere(cmd);
+    }
+}
+
+/// ruff3 P2-b: an escaped quote in an earlier operand.
+#[test]
+fn round2_escaped_quote_in_an_earlier_operand() {
+    for cmd in [
+        "rm -rf \"a\\\"b\" $HOME",
+        "rm -rf \"a\\\"b\" ~",
+        "rm -rf $'a\\'b' ${HOME}",
+        "bash -c 'rm -rf \"a\\\"b\" $HOME'",
+        "rm -rf \"a\\\"|b\" ~",
+        "rm -rf \"a\\\"b;c\" ~",
+        "rm -rf \"a\\\"|b\" $HOME",
+        "rm -rf $'a\\'|b' ~",
+    ] {
+        assert_denied_everywhere(cmd);
+    }
+}
+
+/// ruff3 P2-c: a suffix joined to the home name, ANSI-C parts, `""` inside `-c`.
+#[test]
+fn round2_suffix_ansi_c_and_empty_quotes() {
+    for cmd in [
+        "rm -rf $HOME$(true)",
+        "rm -rf $HOME$x",
+        "rm -rf $HOME${x}",
+        "bash -c 'rm -rf $HOME$(true)'",
+        "rm -rf $HOME`true`",
+        "rm -rf $HOME/$'..'/*",
+        "rm -rf $HOME/$'\\x2e\\x2e'/*",
+        "rm -rf $'/home/alice/'",
+        "rm -rf $'\\x2fUsers/alice/'",
+        "rm -rf ~/$'..'",
+        "bash -c 'rm -rf $HOME\"\"'",
+        "bash -c 'rm -rf $HOME\"/\"'",
+        "eval 'rm -rf $HOME\"\"'",
+        "zsh -c 'rm -rf $HOME\"\"'",
+        "bash -c -- 'rm -rf $HOME\"\"'",
+        "rm -rf $HOME\"\"",
+        "rm -rf $HOME\\/",
+        "rm -rf \"$HOME\"/'..'/*",
+        "rm -rf \"\"$HOME",
+        "rm -rf \"$HOME\"''/",
+    ] {
+        assert_denied_everywhere(cmd);
+    }
+}
+
+/// ruff3 P2-d: a quoted segment with a space, then `..`.
+#[test]
+fn round2_quoted_segment_with_a_space() {
+    for cmd in [
+        "rm -rf \"$HOME/a b/../\"*",
+        "rm -rf \"$HOME/a;b/../\"*",
+        "rm -rf ~/\"a b\"/..",
+        "bash -c 'rm -rf \"$HOME/a b/../\"*'",
+        "rm -rf \"/Users/Alice Smith/\"",
+        "rm -rf \"/Users/Alice Smith\"",
+        "rm -rf /Users/Alice\\ Smith",
+        "rm -rf '/home/alice;smith/'",
+    ] {
+        assert_denied_everywhere(cmd);
+    }
+}
+
+/// ruff3 P2-e and Codex class 7: heredoc bodies, outer quoting layers, a substitution.
+#[test]
+fn round2_heredoc_and_outer_quoting_layers() {
+    for cmd in [
+        "sh <<EOF\nrm -rf 'a|b' ~\nEOF",
+        "sh <<EOF\nrm -rf ~\nEOF",
+        "bash <<'EOF'\nrm -rf $HOME\nEOF",
+        "bash <<< 'rm -rf ~'",
+        "sh <<EOF\nrm -rf \\\"\\$HOME\\\"\nEOF",
+        "bash -c \"rm -rf \\\"\\$HOME\\\"\"",
+        "bash -c \"rm -rf \\\"\\$HOME\\\"/\"",
+        "rm -rf \"$(echo ~)\"",
+        "rm -rf $(echo $HOME)",
+        "bash -c 'echo ready\nrm -rf ~'",
+        "bash -c 'echo ready; rm -rf ~'",
+        "ssh host 'x' ; rm -rf ~",
+    ] {
+        assert_denied_everywhere(cmd);
+    }
+}
+
+#[test]
+fn find_exec_xargs_and_other_wrappers_of_rm() {
+    for cmd in [
+        "find /tmp -exec rm -rf ~ {} \\;",
+        "find /tmp -execdir rm -rf $HOME {} +",
+        "xargs rm -rf ~",
+        "xargs -n1 rm -rf $HOME",
+        "nice -n 5 rm -rf ~",
+        "nice rm -rf ~",
+        "ionice -c3 rm -rf ~",
+        "doas rm -rf ~",
+        "stdbuf -oL rm -rf ~",
+        "env -u X rm -rf ~",
+        "env -S 'rm -rf ~'",
+        "repeat 2 rm -rf ~",
+        "nocorrect rm -rf ~",
+        "- rm -rf ~",
+        "su -c 'rm -rf ~'",
+        "sudo -- rm -rf ~",
+        "grm -rf ~",
+    ] {
+        assert_denied_everywhere(cmd);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Not a deny: what is neither the home folder nor above it.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn plain_paths_below_home_and_harmless_text_stay_allowed() {
+    // Main allows each of these. They are not home, so the AST check adds nothing.
+    for cmd in [
+        "rm -rf ./node_modules",
+        "rm file.txt",
+        "rm -rf ~/proj/build",
+        "rm -rf ~/proj",
+        "rm -rf ~/.cache/x",
+        "rm -rf ~/*.txt",
+        "rm -rf ~/.*rc",
+        "rm -rf ~/..foo",
+        "rm -rf ~/.../x",
+        "rm ~/old.txt",
+        "rm -rf /Users/alice/proj/build",
+        "rm -rf /Users/alice/proj/*",
+        "rm -rf /tmp/x",
         "rm -rf ~/{a,b}",
         "rm -rf ~/{*.txt,*.log}",
-        "rm -rf $HOME/{proj,build}",
+        "rm -rf ~/build/{*,.*}",
         "rm -rf ~/.[!.]*rc",
-        "rm -rf ~/.[a-z]*",
-        "rm -rf ~/{*,.*}/x",
-        "rm -rf $HOME/proj/{*,.*}",
-        "bash -c 'rm -rf ~/{a,b}'",
-    ] {
-        assert_not_home_rule(cmd);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// bash-c-rm-home: the same rule inside `sh -c '...'`
-// ---------------------------------------------------------------------------
-
-#[test]
-fn bash_c_home_forms_match() {
-    for cmd in [
-        "bash -c 'rm -rf ~'",
-        "bash -c 'rm -rf ~/'",
-        "bash -c 'rm -rf ~/*'",
-        "sh -c \"rm -rf $HOME\"",
-        "sh -c 'rm -rf $HOME/'",
-        "bash -c 'rm -rf ${HOME}'",
-        "bash -c 'rm -rf ${HOME}/*'",
-        "bash -c 'cd /tmp && rm -rf ~'",
-        "bash -c 'echo hi; rm -rf ~; echo done'",
-        "bash -c 'rm -Rf ~'",
-        "bash -c 'rm -rf \"$HOME\"'",
-    ] {
-        // The rule on its own.
-        assert!(
-            rule_matches("bash-c-rm-home", cmd),
-            "{cmd:?} must match the rule"
-        );
-        // And the engine denies it (rm-home, on the unquoted text, may fire first).
-        let d = verdict(cmd);
-        assert!(d.is_deny(), "expected DENY for {cmd:?}, got {d:?}");
-    }
-}
-
-#[test]
-fn bash_c_absolute_home_is_denied() {
-    // `bash-c-dangerous` (any `rm` of an absolute path) fires first; the point is that
-    // the command is denied, whichever rule names it.
-    for cmd in [
-        "bash -c 'rm -rf /Users/someone'",
-        "bash -c 'rm -rf /home/someone/'",
-        "bash -c 'rm -rf /Users/someone/*'",
-    ] {
-        let d = verdict(cmd);
-        assert!(d.is_deny(), "expected DENY for {cmd:?}, got {d:?}");
-    }
-}
-
-#[test]
-fn bash_c_subpaths_and_look_alikes_do_not_match() {
-    for cmd in [
-        "bash -c 'rm -rf ~/proj/build'",
-        "bash -c 'rm -rf $HOME/proj/build'",
-        "bash -c 'rm -rf ${HOME}/proj'",
-        "bash -c 'rm -rf $HOME_BACKUP'",
-        "bash -c 'rm -rf ~user/proj'",
-        "bash -c 'rm ~/old.txt'",
-        "bash -c 'rm -rf ./build'",
-        "sh -c \"rm -rf /Users/someone/proj\"",
-    ] {
-        assert!(
-            !rule_matches("bash-c-rm-home", cmd),
-            "{cmd:?} must not match the rule"
-        );
-        assert_not_home_rule(cmd);
-    }
-}
-
-#[test]
-fn bash_c_harmless_text_does_not_match() {
-    // The old rule had no end anchor: any text after `rm ~` or `rm $HOME` matched.
-    for cmd in [
-        "bash -c 'echo \"see rm -rf ~/docs for details\"'",
-        "bash -c 'echo rm $HOMEDIR'",
-        "bash -c 'grep -n \"rm $HOME_X\" notes.txt'",
+        "rm -rf ~+",
+        "echo \"never rm ~\"",
+        "git commit -m \"docs: warn about rm -rf ~\"",
+        "echo 'rm -rf ~'",
+        "echo `ls ~/proj`",
         "bash -c 'echo ok'",
-        "bash -c 'printf \"%s\" \"rm ~/x\"'",
+        "ls ~",
+        "cd ~ && ls",
     ] {
-        assert!(
-            !rule_matches("bash-c-rm-home", cmd),
-            "{cmd:?} must not match the rule"
-        );
         assert_allowed(cmd);
     }
 }
 
 #[test]
-fn bash_c_home_is_denied_at_critical_level_through_rm_home() {
-    // bash-c-rm-home is a High rule; at Critical the unwrapped `rm -rf ~` hits rm-home.
+fn rm_home_is_a_critical_rule() {
+    // The AST check applies at every level, as the regexes do.
     let engine = engine_at(SafetyLevel::Critical);
-    assert_eq!(
-        engine.check_bash("bash -c 'rm -rf ~'").rule_id(),
-        Some("rm-home")
-    );
-    assert!(engine
-        .check_bash("bash -c 'rm -rf ~/proj/build'")
-        .is_allow());
+    for cmd in [
+        "rm -rf ~",
+        "rm -rf ~/",
+        "rm -rf $HOME",
+        "rm -rf /Users/someone",
+        "bash -c 'rm -rf ~'",
+    ] {
+        let d = engine.check_bash(cmd);
+        assert!(d.is_deny(), "{cmd:?}: {d:?}");
+    }
+    assert!(engine.check_bash("rm -rf ~/proj/build").is_allow());
+}
+
+#[test]
+fn deny_reason_names_the_rule() {
+    let d = verdict("rm -rf ~");
+    assert_eq!(d.rule_id(), Some("rm-home"), "{d:?}");
+    let d = verdict("rm -rf ~/{,}");
+    assert_eq!(d.rule_id(), Some("rm-home"), "{d:?}");
+}
+
+// ---------------------------------------------------------------------------
+// dd-disk-device: the nvme fix stays.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dd_nvme_devices_are_denied_and_images_are_not() {
+    for cmd in [
+        "dd if=/dev/zero of=/dev/nvme0n1",
+        "dd if=/dev/zero of=/dev/nvme10n2p3",
+        "dd if=/dev/zero of=/dev/sda",
+    ] {
+        assert_denied_everywhere(cmd);
+    }
+    assert_allowed("dd if=/dev/zero of=/tmp/image");
+    assert_allowed("dd if=/dev/zero of=/dev/null");
 }
