@@ -78,7 +78,7 @@ fn test_safety_level_critical() {
     // But critical should allow git push -f main (that's a high-level rule)
     let json = r#"{"tool_name":"Bash","tool_input":{"command":"git push -f origin main"}}"#;
     let input = HookInput::from_json(json).unwrap();
-    let decision = engine.check(&input);
+    let _decision = engine.check(&input);
     // This might still be blocked by pipe-to-shell or other checks,
     // so we just verify the safety level is applied
     assert_eq!(engine.safety_level(), SafetyLevel::Critical);
