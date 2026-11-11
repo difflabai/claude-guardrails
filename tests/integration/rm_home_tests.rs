@@ -7,6 +7,7 @@
 //! Each form is tested both ways: the rule fires, and it does not fire on the
 //! neighbouring subpath or look-alike name.
 
+use claude_guardrails::rules::dangerous;
 use claude_guardrails::{Config, Decision, SafetyLevel, SecurityEngine};
 
 fn engine_at(level: SafetyLevel) -> SecurityEngine {
@@ -22,8 +23,15 @@ fn verdict(command: &str) -> Decision {
 #[track_caller]
 fn assert_rule(command: &str, rule_id: &str) {
     let d = verdict(command);
-    assert!(d.is_deny(), "expected DENY by {rule_id} for {command:?}, got {d:?}");
-    assert_eq!(d.rule_id(), Some(rule_id), "wrong rule for {command:?}: {d:?}");
+    assert!(
+        d.is_deny(),
+        "expected DENY by {rule_id} for {command:?}, got {d:?}"
+    );
+    assert_eq!(
+        d.rule_id(),
+        Some(rule_id),
+        "wrong rule for {command:?}: {d:?}"
+    );
 }
 
 /// Not denied by `rm-home` or `bash-c-rm-home`. Other rules are not the subject here.
@@ -190,23 +198,44 @@ fn look_alike_names_do_not_match() {
     }
 }
 
-#[test]
-fn quoted_tilde_and_single_quoted_variable_are_literal_names() {
-    // The shell does not expand these, so they do not name the home directory.
-    for cmd in ["rm -rf \"~\"", "rm -rf '~'", "rm -rf '$HOME'", "rm -rf \"~/\""] {
-        assert_not_home_rule(cmd);
-    }
+/// The pattern of one rule, to test the rule on its own. The engine also checks the
+/// command with its quotes removed (wrapper unwrapping), so a quote-sensitive rule
+/// cannot be tested through the engine.
+fn rule_matches(rule_id: &str, text: &str) -> bool {
+    let rules = dangerous::get_rules_for_level(SafetyLevel::Strict);
+    let rule = rules
+        .iter()
+        .find(|r| r.id == rule_id)
+        .unwrap_or_else(|| panic!("no rule {rule_id}"));
+    regex::Regex::new(rule.pattern).unwrap().is_match(text)
 }
 
 #[test]
-fn prose_mentioning_rm_and_home_in_quotes_does_not_match() {
-    // The word after the name is a quote, not a terminator.
-    for cmd in [
+fn rm_home_pattern_honours_quotes() {
+    // Quoted tilde and single-quoted variable are literal names: not the home directory.
+    for text in [
+        "rm -rf \"~\"",
+        "rm -rf '~'",
+        "rm -rf '$HOME'",
+        "rm -rf \"~/\"",
+    ] {
+        assert!(!rule_matches("rm-home", text), "{text:?} must not match");
+    }
+    // A quote after the name only counts when the name was quoted: prose is not a match.
+    for text in [
         "echo \"never rm $HOME\"",
         "echo \"never rm ~\"",
         "git commit -m \"docs: warn about rm ~\"",
     ] {
-        assert_not_home_rule(cmd);
+        assert!(!rule_matches("rm-home", text), "{text:?} must not match");
+    }
+    // The quoted spellings that do name the home directory.
+    for text in [
+        "rm -rf \"$HOME\"",
+        "rm -rf \"${HOME}/\"",
+        "rm -rf '/Users/someone'",
+    ] {
+        assert!(rule_matches("rm-home", text), "{text:?} must match");
     }
 }
 
@@ -222,7 +251,12 @@ fn safe_rm_still_allowed() {
 fn rm_home_is_a_critical_rule() {
     // Active at every level, including Critical.
     let engine = engine_at(SafetyLevel::Critical);
-    for cmd in ["rm -rf ~", "rm -rf ~/", "rm -rf $HOME", "rm -rf /Users/someone"] {
+    for cmd in [
+        "rm -rf ~",
+        "rm -rf ~/",
+        "rm -rf $HOME",
+        "rm -rf /Users/someone",
+    ] {
         let d = engine.check_bash(cmd);
         assert_eq!(d.rule_id(), Some("rm-home"), "{cmd:?}: {d:?}");
     }
@@ -248,9 +282,14 @@ fn bash_c_home_forms_match() {
         "bash -c 'rm -Rf ~'",
         "bash -c 'rm -rf \"$HOME\"'",
     ] {
+        // The rule on its own.
+        assert!(
+            rule_matches("bash-c-rm-home", cmd),
+            "{cmd:?} must match the rule"
+        );
+        // And the engine denies it (rm-home, on the unquoted text, may fire first).
         let d = verdict(cmd);
         assert!(d.is_deny(), "expected DENY for {cmd:?}, got {d:?}");
-        assert_eq!(d.rule_id(), Some("bash-c-rm-home"), "{cmd:?}: {d:?}");
     }
 }
 
@@ -280,6 +319,10 @@ fn bash_c_subpaths_and_look_alikes_do_not_match() {
         "bash -c 'rm -rf ./build'",
         "sh -c \"rm -rf /Users/someone/proj\"",
     ] {
+        assert!(
+            !rule_matches("bash-c-rm-home", cmd),
+            "{cmd:?} must not match the rule"
+        );
         assert_not_home_rule(cmd);
     }
 }
@@ -294,18 +337,23 @@ fn bash_c_harmless_text_does_not_match() {
         "bash -c 'echo ok'",
         "bash -c 'printf \"%s\" \"rm ~/x\"'",
     ] {
-        assert_not_home_rule(cmd);
+        assert!(
+            !rule_matches("bash-c-rm-home", cmd),
+            "{cmd:?} must not match the rule"
+        );
+        assert_allowed(cmd);
     }
 }
 
 #[test]
-fn bash_c_rm_home_at_critical_level_follows_the_rule_level() {
-    // bash-c-rm-home is a High rule: Critical does not run it.
+fn bash_c_home_is_denied_at_critical_level_through_rm_home() {
+    // bash-c-rm-home is a High rule; at Critical the unwrapped `rm -rf ~` hits rm-home.
     let engine = engine_at(SafetyLevel::Critical);
-    assert!(engine.check_bash("bash -c 'rm -rf ~'").is_allow());
-    let engine = engine_at(SafetyLevel::High);
     assert_eq!(
         engine.check_bash("bash -c 'rm -rf ~'").rule_id(),
-        Some("bash-c-rm-home")
+        Some("rm-home")
     );
+    assert!(engine
+        .check_bash("bash -c 'rm -rf ~/proj/build'")
+        .is_allow());
 }
