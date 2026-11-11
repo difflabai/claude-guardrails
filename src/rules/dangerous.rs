@@ -17,19 +17,7 @@ pub const CRITICAL_RULES: &[Rule] = &[
     Rule::new(
         "rm-home",
         SafetyLevel::Critical,
-        // The home directory itself and all its contents, never a real subpath:
-        //   ~  ~/  ~/*  ~name  $HOME  ${HOME}  "$HOME"  "$HOME/"  /home/u  /Users/u
-        // each with or without a trailing `/`, `//`, `/.`, `/*`, `/**` or `/.*` (all of the
-        // directory's contents), then end of text, whitespace,
-        // `;`, `&`, `|`, `)` or a backtick. Any operand of rm can be the home directory,
-        // and an earlier operand is one shell word: a quoted or escaped `|`, `;`, `&` or
-        // `)` in it does not end it. A quote after the name only counts when the name was
-        // quoted (`"$HOME"`), so `echo "rm ~"` is not a match. `~` and `$HOME` are literal
-        // in the wrong quotes: `'~'` is not.
-        // Also all of the contents by glob: `{*,.*}`, `.[!.]*`, `.[^.]*`, `..?*`, `.??*`.
-        // Any `..` segment after the name (`~/..`, `$HOME/build/..`) reaches the home
-        // directory or its parent. A regex cannot count, so `~/proj/../x` is refused too.
-        r##"\brm\s+(?:(?:'[^']*'|"[^"]*"|\\.|[^\s;&|)'"\\`])+\s+)*?(?:(?:~[A-Za-z0-9_.-]*|(?:\$HOME|\$\{HOME\})|(?:/home/[^/\s"';&|)`]+|/Users/[^/\s"';&|)`]+))(?:(?:/+(?:\.|\*+|\.\*|\.\[[!^]\.\]\*|\.\?+\*|\.\.\?\*|\{(?:[^{}\s;&|)'"`]*,)*(?:\*+|\.\*|\.\[[!^]\.\]\*)(?:,[^{}\s;&|)'\"`]*)*\})?/*)?|(?:/+[^/\s;&|)'"`]+)*/+\.\.(?:/[^\s;&|)'"`]*)?)|"(?:(?:\$HOME|\$\{HOME\})|(?:/home/[^/\s"';&|)`]+|/Users/[^/\s"';&|)`]+))(?:(?:/+(?:\.|\*+|\.\*|\.\[[!^]\.\]\*|\.\?+\*|\.\.\?\*|\{(?:[^{}\s;&|)'"`]*,)*(?:\*+|\.\*|\.\[[!^]\.\]\*)(?:,[^{}\s;&|)'\"`]*)*\})?/*)?|(?:/+[^/\s;&|)'"`]+)*/+\.\.(?:/[^\s;&|)'"`]*)?)"(?:(?:/+(?:\.|\*+|\.\*|\.\[[!^]\.\]\*|\.\?+\*|\.\.\?\*|\{(?:[^{}\s;&|)'"`]*,)*(?:\*+|\.\*|\.\[[!^]\.\]\*)(?:,[^{}\s;&|)'\"`]*)*\})?/*)?|(?:/+[^/\s;&|)'"`]+)*/+\.\.(?:/[^\s;&|)'"`]*)?)|'(?:/home/[^/\s"';&|)`]+|/Users/[^/\s"';&|)`]+)(?:(?:/+(?:\.|\*+|\.\*|\.\[[!^]\.\]\*|\.\?+\*|\.\.\?\*|\{(?:[^{}\s;&|)'"`]*,)*(?:\*+|\.\*|\.\[[!^]\.\]\*)(?:,[^{}\s;&|)'\"`]*)*\})?/*)?|(?:/+[^/\s;&|)'"`]+)*/+\.\.(?:/[^\s;&|)'"`]*)?)'(?:(?:/+(?:\.|\*+|\.\*|\.\[[!^]\.\]\*|\.\?+\*|\.\.\?\*|\{(?:[^{}\s;&|)'"`]*,)*(?:\*+|\.\*|\.\[[!^]\.\]\*)(?:,[^{}\s;&|)'\"`]*)*\})?/*)?|(?:/+[^/\s;&|)'"`]+)*/+\.\.(?:/[^\s;&|)'"`]*)?))(?:\s|;|&|\||\)|`|$)"##,
+        r"\brm\s+(-[rfv]+\s+)*(~|\$HOME|/home/\w+)\b",
         "Attempting to delete home directory",
     ),
     Rule::new(
@@ -233,10 +221,7 @@ pub const HIGH_RULES: &[Rule] = &[
     Rule::new(
         "bash-c-rm-home",
         SafetyLevel::High,
-        // Same targets as rm-home, inside a quoted `-c` string: the closing quote ends the
-        // name, so `bash -c 'rm -rf ~'` matches and `bash -c 'echo rm $HOMEDIR'` does not.
-        // Operands, backticks, `..` segments and brace or dot globs work as in rm-home.
-        r##"\b(ba)?sh\s+-c\s+['"].*\brm\s+(?:(?:'[^']*'|"[^"]*"|\\.|[^\s;&|)'"\\`])+\s+)*?(?:(?:~[A-Za-z0-9_.-]*|(?:\$HOME|\$\{HOME\}))(?:(?:/+(?:\.|\*+|\.\*|\.\[[!^]\.\]\*|\.\?+\*|\.\.\?\*|\{(?:[^{}\s;&|)'"`]*,)*(?:\*+|\.\*|\.\[[!^]\.\]\*)(?:,[^{}\s;&|)'\"`]*)*\})?/*)?|(?:/+[^/\s;&|)'"`]+)*/+\.\.(?:/[^\s;&|)'"`]*)?)|"(?:\$HOME|\$\{HOME\})(?:(?:/+(?:\.|\*+|\.\*|\.\[[!^]\.\]\*|\.\?+\*|\.\.\?\*|\{(?:[^{}\s;&|)'"`]*,)*(?:\*+|\.\*|\.\[[!^]\.\]\*)(?:,[^{}\s;&|)'\"`]*)*\})?/*)?|(?:/+[^/\s;&|)'"`]+)*/+\.\.(?:/[^\s;&|)'"`]*)?)"(?:(?:/+(?:\.|\*+|\.\*|\.\[[!^]\.\]\*|\.\?+\*|\.\.\?\*|\{(?:[^{}\s;&|)'"`]*,)*(?:\*+|\.\*|\.\[[!^]\.\]\*)(?:,[^{}\s;&|)'\"`]*)*\})?/*)?|(?:/+[^/\s;&|)'"`]+)*/+\.\.(?:/[^\s;&|)'"`]*)?))(?:\s|;|&|\||\)|`|['"]|$)"##,
+        r#"\b(ba)?sh\s+-c\s+['"].*\brm\s+(-[rf]+\s+)*(~|\$HOME)"#,
         "Shell -c with rm targeting home directory",
     ),
     Rule::new(

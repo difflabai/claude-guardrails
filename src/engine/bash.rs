@@ -7,7 +7,7 @@
 use crate::config::{Config, SafetyLevel};
 use crate::output::Decision;
 use crate::parser::ast;
-use crate::parser::{shell, wrapper};
+use crate::parser::{rm_home, shell, wrapper};
 use crate::rules::dangerous;
 use crate::rules::exfiltration;
 
@@ -115,6 +115,13 @@ pub fn check_command(
         }
     }
 
+    // 8. Last, the AST check for `rm` of the home directory. The `rm-home` regexes above
+    // are main's; this only adds denials for what they miss (quotes, braces, escapes,
+    // substitutions, a redirection with no space before it).
+    if let Some(decision) = check_rm_home_ast(command) {
+        return decision;
+    }
+
     Decision::allow("passed all checks")
 }
 
@@ -180,7 +187,19 @@ fn check_command_fallback(
         }
     }
 
+    if let Some(decision) = check_rm_home_ast(command) {
+        return decision;
+    }
+
     Decision::allow("passed all checks (fallback)")
+}
+
+/// The `rm-home` AST check: `rm` of the home directory, above it, or a glob over its
+/// contents, found in the parsed command (see `parser::rm_home`).
+fn check_rm_home_ast(command: &str) -> Option<Decision> {
+    rm_home::denies(command).then(|| {
+        Decision::deny("rm-home", "Attempting to delete home directory")
+    })
 }
 
 /// Check a command against the dangerous rules
