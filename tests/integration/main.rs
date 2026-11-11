@@ -3,3 +3,4 @@
 mod bash_tests;
 mod file_tests;
 mod override_tests;
+mod rm_home_tests;
