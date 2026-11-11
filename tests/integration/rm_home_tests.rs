@@ -108,6 +108,43 @@ fn absolute_home_forms_match() {
 }
 
 #[test]
+fn spellings_of_the_directory_and_all_its_contents_match() {
+    for cmd in [
+        "rm -rf ~//",
+        "rm -rf ~/.",
+        "rm -rf ~/./",
+        "rm -rf ~/**",
+        "rm -rf ~/.*",
+        "rm -rf ~/*/",
+        "rm -rf $HOME//",
+        "rm -rf $HOME/.",
+        "rm -rf $HOME/.*",
+        "rm -rf ${HOME}/**",
+        "rm -rf \"$HOME/.\"",
+        "rm -rf /Users/someone/.",
+        "rm -rf /Users/someone//",
+        "rm -rf /home/someone/.*",
+    ] {
+        assert_rule(cmd, "rm-home");
+    }
+}
+
+#[test]
+fn partial_globs_and_dot_names_are_subpaths() {
+    for cmd in [
+        "rm -rf ~/*.txt",
+        "rm -rf ~/.cache",
+        "rm -rf ~/.*rc",
+        "rm -rf ~/..foo",
+        "rm -rf $HOME/*.log",
+        "rm -rf $HOME/.cache",
+        "rm -rf /Users/someone/*.o",
+    ] {
+        assert_not_home_rule(cmd);
+    }
+}
+
+#[test]
 fn each_form_is_followed_by_a_terminator() {
     // End of line, whitespace, ; & | or ).
     for cmd in [
