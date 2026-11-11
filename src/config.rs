@@ -33,6 +33,7 @@ impl SafetyLevel {
     }
 
     /// Parse from string
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "critical" => Some(SafetyLevel::Critical),
@@ -187,9 +188,9 @@ impl Config {
 
     /// Expand ~ in path strings
     pub fn expand_path(path: &str) -> PathBuf {
-        if path.starts_with("~/") {
+        if let Some(rest) = path.strip_prefix("~/") {
             if let Some(home) = dirs::home_dir() {
-                return home.join(&path[2..]);
+                return home.join(rest);
             }
         }
         PathBuf::from(path)

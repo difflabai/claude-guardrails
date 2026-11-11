@@ -227,7 +227,7 @@ fn normalize_command_name(node: &Node, source: &str) -> (String, bool) {
             "concatenation" => {
                 let normalized = normalize_concatenation(&child, source);
                 // Check if any part of the concatenation is dynamic
-                let is_dynamic = has_dynamic_parts(&child, source);
+                let is_dynamic = has_dynamic_parts(&child);
                 return (normalized, is_dynamic);
             }
             // Simple word
@@ -288,13 +288,13 @@ fn normalize_concatenation(node: &Node, source: &str) -> String {
 }
 
 /// Check if a node contains dynamic parts (variables, command substitution)
-fn has_dynamic_parts(node: &Node, source: &str) -> bool {
+fn has_dynamic_parts(node: &Node) -> bool {
     match node.kind() {
         "simple_expansion" | "expansion" | "command_substitution" => true,
         _ => {
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                if has_dynamic_parts(&child, source) {
+                if has_dynamic_parts(&child) {
                     return true;
                 }
             }
